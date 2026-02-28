@@ -39,6 +39,7 @@ typedef WORD uint16_t;
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h> /* for TCP_NODELAY */
 #include <poll.h>
 #include <stdint.h>
 #include <sys/socket.h>
@@ -46,6 +47,7 @@ typedef WORD uint16_t;
 #include <unistd.h>
 #define INVALID_SOCKET -1
 #endif
+
 
 #include <errno.h>
 #include <stdio.h>
@@ -108,6 +110,10 @@ static SOCKET opensock(unsigned short port)
 
 #if HAVE_DECL_SO_NOSIGPIPE
     if (setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, (void *) &yes, sizeof yes) != 0)
+        goto err;
+#endif
+#ifdef TCP_NODELAY
+    if(setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (void *) &yes, sizeof yes) != 0)
         goto err;
 #endif
 
