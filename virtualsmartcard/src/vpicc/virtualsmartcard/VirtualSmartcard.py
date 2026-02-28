@@ -514,6 +514,7 @@ class VirtualICC(object):
     def openPort(port):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         server_socket.bind(('', port))
         server_socket.listen(0)
         logging.info("Waiting for vpcd on port " + str(port))
