@@ -230,6 +230,7 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
             listenSocket.setSoTimeout(1000);
             try {
                 socket = listenSocket.accept();
+                socket.setTcpNoDelay(true);
             } catch (SocketTimeoutException ignored){}
             if (socket != null){
                 break;
@@ -260,6 +261,7 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
     private void vpcdConnect(String hostname, int port) throws IOException {
         listenSocket = null;
         socket = new Socket(InetAddress.getByName(hostname), port);
+        socket.setTcpNoDelay(true);
         outputStream = socket.getOutputStream();
         inputStream = socket.getInputStream();
     }
