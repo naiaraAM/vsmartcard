@@ -53,10 +53,12 @@ extern const char *local_ip (void);
 #define DEFAULT_KEY_DIR ".config/vpcd"
 #define PRIVATE_KEY_FILE "vpcd_x25519_private.pem"
 #define PUBLIC_KEY_FILE "vpcd_x25519_public.hex"
+#define QR_SECRET_FILE "vpcd_qr_secret.hex"
 
 static char device_id[64];
 static char pairing_id[64];
 static char public_key_hex[128];
+static char qr_secret[64];
 
 
 
@@ -243,6 +245,59 @@ static int ensure_keypair(char *pub_hex, size_t cap)
     return 0;
 }
 
+static int ensure_qr_secret(char *out, size_t cap)
+{
+    char dir_buf[512];
+    char secret_path[600];
+    const char *dir = key_dir_path(dir_buf, sizeof dir_buf);
+    FILE *f = NULL;
+
+    if (cap < 33) {
+        fprintf(stderr, "QR secret buffer too small\n");
+        return -1;
+    }
+
+#ifndef _WIN32
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+        fprintf(stderr, "Failed to create key dir: %s\n", dir);
+        return -1;
+    }
+#endif
+
+    if (snprintf(secret_path, sizeof secret_path, "%s/%s", dir, QR_SECRET_FILE) < 0)
+        return -1;
+
+    f = fopen(secret_path, "r");
+    if (f) {
+        if (fgets(out, (int) cap, f) != NULL) {
+            trim_newline(out);
+            fclose(f);
+            if (out[0] != '\0')
+                return 0;
+        } else {
+            fclose(f);
+        }
+    }
+
+    if (generate_random_id(out, cap) != 0) {
+        fprintf(stderr, "Failed to generate qr_secret\n");
+        return -1;
+    }
+
+    f = fopen(secret_path, "w");
+    if (!f) {
+        fprintf(stderr, "Failed to write qr_secret: %s\n", secret_path);
+        return -1;
+    }
+    fprintf(f, "%s\n", out);
+    fclose(f);
+#ifndef _WIN32
+    chmod(secret_path, 0600);
+#endif
+
+    return 0;
+}
+
 static int read_machine_id(char *out, size_t cap)
 {
     const char *env = getenv("VPCD_MACHINE_ID");
@@ -409,7 +464,6 @@ static int do_handshake(void)
         char *newline = strchr(response, '\n');
         if (newline)
             *newline = '\0';
-        // printf("Handshake response: %s\n", response);
 
         const char *p = strstr(response, "\"status_code\"");
         if (!p) {
@@ -475,6 +529,12 @@ int main ( int argc , char *argv[] )
         goto err;
     }
 
+    if (ensure_qr_secret(qr_secret, sizeof qr_secret) != 0) {
+        fprintf(stderr, "Failed to load or create qr_secret.\n");
+        fail = 1;
+        goto err;
+    }
+
     for (slot = 0; slot < VICC_MAX_SLOTS; slot++) {
         port = VPCDPORT+slot;
         printf("VPCD hostname:  %s\n", ip);
@@ -482,9 +542,11 @@ int main ( int argc , char *argv[] )
         printf("Pairing ID:     %s\n", pairing_id);
         printf("Device ID:      %s\n", device_id);
         printf("Public Key:     %s\n", public_key_hex);
+        printf("QR Secret:      %s\n", qr_secret);
         printf("On your NFC phone with the Remote Smart Card Reader app scan this code:\n");
-        int n = snprintf(uri, sizeof uri, "vpcd://pairing_id=%s&pc_id=%s&pubkey=%s",
-                         pairing_id, device_id, public_key_hex);
+        int n = snprintf(uri, sizeof uri,
+                         "vpcd://pairing_id=%s&pc_id=%s&pubkey=%s&qr_secret=%s",
+                         pairing_id, device_id, public_key_hex, qr_secret);
         if (n < 0) {
             fprintf(stderr, "Failed to build QR URI\n");
             continue;
