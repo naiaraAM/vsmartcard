@@ -20,23 +20,53 @@
 
         <EditTextPreference
             android:key="hostname"
-            android:defaultValue="10.0.2.2"
-            android:title="@string/hint_vpcd_hostname"
+            android:defaultValue="middlepoint.test"
+            android:title="DNS name"
             android:hint="URL or IP address"
             android:inputType="textUri" />
 
         <EditTextPreference
             android:key="port"
-            android:defaultValue="35963"
-            android:title="@string/hint_vpcd_port"
+            android:defaultValue="80"
+            android:title="DNS port"
             android:inputType="number"
-            android:hint="Default: 35963" />
+            android:hint="Default: 80" />
 
         <CheckBoxPreference
             android:key="listen"
             android:defaultValue="false"
             android:title="@string/hint_vpcd_listen"
             android:hint="Default: false" />
+
+        <Preference
+            android:key="pairing_id"
+            android:title="Pairing ID"
+            android:summary="XXXXXXXXXXXXXXX" />
+
+        <Preference
+            android:key="device_id"
+            android:title="Device ID"
+            android:summary="XXXXXXXXXXXXXXX" />
+
+        <Preference
+            android:key="remote_id"
+            android:title="Remote PC ID"
+            android:summary="XXXXXXXXXXXXXXX" />
+
+        <Preference
+            android:key="pubkey_pc"
+            android:title="Public key remote PC"
+            android:summary="XXXXXXXXXXXXXXX" />
+
+        <Preference
+            android:key="pubkey_app"
+            android:title="Public key app"
+            android:summary="XXXXXXXXXXXXXXX" />
+
+        <Preference
+        android:key="qr_secret"
+        android:title="QR Secret"
+        android:summary="XXXXXXXXXXXXXXX" />
 
     </PreferenceCategory>
 

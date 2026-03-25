@@ -40,6 +40,7 @@ import com.google.android.material.snackbar.Snackbar;
 import com.google.zxing.integration.android.IntentIntegrator;
 import com.google.zxing.integration.android.IntentResult;
 
+import java.net.URI;
 import java.util.Objects;
 
 /**
@@ -166,10 +167,31 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
             // to their values. When their values change, their summaries are
             // updated to reflect the new value, per the Android Design
             // guidelines.
-            bindPreferenceSummaryToValue(findPreference("hostname"));
-            bindPreferenceSummaryToValue(findPreference("port"));
+            // bindPreferenceSummaryToValue(findPreference("hostname"));
+            // bindPreferenceSummaryToValue(findPreference("port"));
+
+            
+            CryptoUtils.ensureConscrypt();
+            getOrCreateDeviceId(getActivity());
+            try {
+                CryptoUtils.ensureAndStorePublicKey(getActivity());
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+            
+
+            
             bindPreferenceSummaryToValue(findPreference("delay"));
             bindPreferenceSummaryToValue(findPreference("timeout"));
+
+            // add new fields
+            bindPreferenceSummaryToValue(findPreference("pairing_id"));
+            bindPreferenceSummaryToValue(findPreference("device_id"));
+            bindPreferenceSummaryToValue(findPreference("remote_id"));
+            bindPreferenceSummaryToValue(findPreference("pubkey_pc"));
+            bindPreferenceSummaryToValue(findPreference("pubkey_app"));
+            bindPreferenceSummaryToValue(findPreference("qr_secret"));
+
 
             Preference nfcSettings = findPreference("nfcSettings");
             nfcSettings.setOnPreferenceClickListener(new Preference.OnPreferenceClickListener() {
@@ -211,16 +233,27 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
 
     private void handleScannedURI(Uri uri) {
         try {
-            String h, p;
-            h = uri.getHost();
-            int _p = uri.getPort();
-            if (_p < 0) {
-                _p = VPCDWorker.DEFAULT_PORT;
-            }
-            p = Integer.toString(_p);
+            String pairing_id, pc_id, pub_key_pc, qr_secret;
+
+            // get fields by name
+            pairing_id = getParam(uri, "pairing_id");
+            pc_id = getParam(uri, "pc_id");
+            pub_key_pc = getParam(uri, "pubkey");
+            qr_secret = getParam(uri, "qr_secret");
+
+            CryptoUtils.ensureConscrypt();
+            String deviceId = getOrCreateDeviceId(this);
+            String pubKeyApp = CryptoUtils.ensureAndStorePublicKey(this);
+
+
             SharedPreferences SP = PreferenceManager.getDefaultSharedPreferences(this);
-            SP.edit().putString("hostname", h).apply();
-            SP.edit().putString("port", p).apply();
+            SP.edit().putString("pairing_id", pairing_id).apply();
+            SP.edit().putString("device_id", deviceId).apply();
+            SP.edit().putString("remote_id", pc_id).apply();
+            SP.edit().putString("pubkey_pc", pub_key_pc).apply();
+            SP.edit().putString("pubkey_app", pubKeyApp).apply();
+            SP.edit().putString("qr_secret", qr_secret).apply();
+            
             getFragmentManager().beginTransaction().replace(android.R.id.content,
                     new VPCDPreferenceFragment()).commit();
         } catch (Exception e) {
@@ -245,5 +278,46 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
     public void onNewIntent(Intent intent) {
         // onResume gets called after this to handle the intent
         setIntent(intent);
+    }
+
+    private static String getOrCreateDeviceId(Context ctx) {
+        SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(ctx);
+        String existing = sp.getString("device_id", null);
+        if (existing != null && !existing.isEmpty()) {
+            return existing;
+        }
+
+        byte[] bytes = new byte[16];
+        new java.security.SecureRandom().nextBytes(bytes);
+        StringBuilder sb = new StringBuilder();
+        for (byte b : bytes) {
+            sb.append(String.format("%02x", b));
+        }
+
+        String id = sb.toString();
+        sp.edit().putString("device_id", id).apply();
+        return id;
+    }
+
+    private static String getParam(Uri uri, String key) {
+        String val = uri.getQueryParameter(key);
+        if (val != null) {
+            return val;
+        }
+
+        String ssp = uri.getSchemeSpecificPart();
+        if (ssp == null) {
+            return null;
+        }
+
+        if (ssp.startsWith("//")) {
+            ssp = ssp.substring(2);
+        }
+        if (ssp.startsWith("?")) {
+            ssp = ssp.substring(1);
+        }
+
+        Uri tmp = Uri.parse("http://dummy/?" + ssp);
+        return tmp.getQueryParameter(key);
     }
 }
