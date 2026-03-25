@@ -21,7 +21,9 @@ import java.util.Arrays;
 
 import org.conscrypt.Conscrypt;
 
-
+/**
+ * Utility class for cryptographic operations, including key generation, encoding, and secure storage.
+ */
 public class CryptoUtils {
 
     private static final String SEC_PREFS =         "crypto_prefs";
@@ -29,7 +31,13 @@ public class CryptoUtils {
 
     private CryptoUtils() {}
 
+    /**
+     * Convert a byte array to a hexadecimal string.
+     * @param bytes the byte array to convert
+     * @return the hexadecimal string representation of the byte array
+     */
     public static String bytesToHex(byte[] bytes) {
+        // convert byte array to hex string
         StringBuilder sb = new StringBuilder(bytes.length * 2);
         for (byte b : bytes) {
             sb.append(String.format("%02x", b));
@@ -37,6 +45,11 @@ public class CryptoUtils {
         return sb.toString();
     }
 
+    /**
+     * Convert a BigInteger to a 32-byte array, padding with leading zeros if necessary.
+     * @param u the BigInteger to convert
+     * @return the 32-byte array representation of the BigInteger
+     */
     public static byte[] toRaw32(BigInteger u) {
         byte[] raw = u.toByteArray();
         byte[] out = new byte[32];
@@ -50,6 +63,11 @@ public class CryptoUtils {
     }
 
 
+    /**
+     * Generate an X25519 key pair using Conscrypt provider.
+     * @return the generated KeyPair
+     * @throws Exception if key generation fails
+     */
     public static KeyPair generateX25519KeyPair() throws Exception {
         ensureConscrypt();
         KeyPairGenerator kpg = KeyPairGenerator.getInstance("X25519");
@@ -57,6 +75,11 @@ public class CryptoUtils {
         return kpg.generateKeyPair();
     }
 
+    /**
+     * Extract the raw public key bytes from a KeyPair.
+     * @param kp the KeyPair from which to extract the public key
+     * @return the raw public key bytes
+     */
     public static byte[] getRawPublicKeyBytes(KeyPair kp) {
         PublicKey pub = kp.getPublic();
         try {
@@ -75,7 +98,11 @@ public class CryptoUtils {
         return raw;
     }
 
-
+    /**
+     * Extract the raw public key bytes from a SubjectPublicKeyInfo (SPKI) encoded byte array.
+     * @param spki the SPKI encoded byte array
+     * @return the raw public key bytes, or null if not found
+     */
     private static byte[] extractX25519RawFromSpki(byte[] spki) {
         for (int i = 0; i + 35 <= spki.length; i++) {
             if ((spki[i] & 0xFF) == 0x03 &&
@@ -87,7 +114,14 @@ public class CryptoUtils {
         return null;
     }
 
-
+    /**
+     * Ensure that a public key is generated and stored in SharedPreferences.
+     * If a public key already exists, it is returned.
+     * Otherwise, a new key pair is generated, the public key is stored in SharedPreferences, and the private key is securely stored using EncryptedSharedPreferences.
+     * @param ctx the application context
+     * @return the hexadecimal string representation of the public key
+     * @throws Exception if key generation or storage fails
+     */
     public static String ensureAndStorePublicKey(Context ctx) throws Exception {
         SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(ctx);
         String existing = sp.getString("pubkey_app", null);
@@ -105,12 +139,21 @@ public class CryptoUtils {
         return pubHex;
     }
 
+    /**
+     * Ensure that the Conscrypt provider is available.
+     */
     public static void ensureConscrypt() {
         if (Security.getProvider("Conscrypt") == null) {
             Security.insertProviderAt(Conscrypt.newProvider(), 1);
         }
     }
 
+    /**
+     * Get an instance of EncryptedSharedPreferences for secure storage of sensitive data.
+     * @param ctx the application context
+     * @return the EncryptedSharedPreferences instance
+     * @throws Exception if secure preference initialization fails
+     */
     private static SharedPreferences securePrefs(Context ctx) throws Exception {
         MasterKey masterKey = new MasterKey.Builder(ctx)
             .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
@@ -125,6 +168,13 @@ public class CryptoUtils {
         );
     }
 
+    /**
+     * Store the private key securely in EncryptedSharedPreferences.
+     * The private key is encoded in PKCS#8 format and stored as a Base64 string.
+     * @param ctx the application context
+     * @param priv the private key to store
+     * @throws Exception if storage fails
+     */
     public static void storePrivateKey(Context ctx, PrivateKey priv) throws Exception {
         byte[] pkcs8 = priv.getEncoded();
         String b64 = Base64.encodeToString(pkcs8, Base64.NO_WRAP);
@@ -133,6 +183,12 @@ public class CryptoUtils {
         sp.edit().putString(PRIV_KEY, b64).apply();
     }
 
+    /**
+     * Load the private key from EncryptedSharedPreferences.
+     * @param ctx the application context
+     * @return the loaded PrivateKey, or null if not found
+     * @throws Exception if loading fails
+     */
     public static PrivateKey loadPrivateKey(Context ctx) throws Exception {
         ensureConscrypt();
 

@@ -179,8 +179,6 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
                 e.printStackTrace();
             }
             
-
-            
             bindPreferenceSummaryToValue(findPreference("delay"));
             bindPreferenceSummaryToValue(findPreference("timeout"));
 
@@ -281,6 +279,7 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
     }
 
     private static String getOrCreateDeviceId(Context ctx) {
+        // try to get existing device id or create a new one if not present
         SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(ctx);
         String existing = sp.getString("device_id", null);
         if (existing != null && !existing.isEmpty()) {
@@ -300,6 +299,7 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
     }
 
     private static String getParam(Uri uri, String key) {
+        // first try to get the parameter by name
         String val = uri.getQueryParameter(key);
         if (val != null) {
             return val;
