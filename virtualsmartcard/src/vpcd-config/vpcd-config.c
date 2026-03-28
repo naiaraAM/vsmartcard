@@ -34,6 +34,12 @@
 #include "vpcd.h"
 
 extern const char *local_ip (void);
+static int read_file_line(const char *path, char *out, size_t cap);
+static int write_file_line(const char *path, const char *value);
+
+static int persist_pairing_id(const char *id);
+static int load_pairing_id(char *out, size_t cap);
+static int persist_device_id(const char *id);
 
 #ifdef _WIN32
 #define VICC_MAX_SLOTS 1
@@ -49,14 +55,17 @@ extern const char *local_ip (void);
 #define INVALID_SOCKET -1
 #endif
 
-#define ERROR_STRING "Unable to guess local IP address"
-#define DEFAULT_HANDSHAKE_HOST "middlepoint.test"
-#define DEFAULT_HANDSHAKE_PORT "80"
-#define DEFAULT_KEY_DIR ".config/vpcd"
-#define PRIVATE_KEY_FILE "vpcd_x25519_private.pem"
-#define PUBLIC_KEY_FILE "vpcd_x25519_public.hex"
-#define QR_SECRET_FILE "vpcd_qr_secret.hex"
-#define SHARED_SECRET_FILE "vpcd_shared_secret.hex"
+#define ERROR_STRING            "Unable to guess local IP address"
+#define DEFAULT_HANDSHAKE_HOST  "middlepoint.test"
+#define DEFAULT_HANDSHAKE_PORT  "80"
+#define DEFAULT_KEY_DIR         ".config/vpcd"
+#define PRIVATE_KEY_FILE        "vpcd_x25519_private.pem"
+#define PUBLIC_KEY_FILE         "vpcd_x25519_public.hex"
+#define QR_SECRET_FILE          "vpcd_qr_secret.hex"
+#define SHARED_SECRET_FILE      "vpcd_shared_secret.hex"
+#define PAIRING_ID_FILE         "vpcd_pairing_id.hex"
+#define DEVICE_ID_FILE          "vpcd_device_id.hex"
+#define ENV_FILE                "vpcd_env.sh"
 
 static char device_id[64];
 static char pairing_id[64];
@@ -302,19 +311,18 @@ static const char *key_dir_path(char *buf, size_t cap)
     const char *env = getenv("VPCD_KEY_DIR");
     if (env && *env)
         return env;
-#ifdef _WIN32
-    const char *base = getenv("APPDATA");
-    if (base && *base && buf && cap > 0) {
-        snprintf(buf, cap, "%s\\%s", base, DEFAULT_KEY_DIR);
-        return buf;
+
+#ifndef _WIN32
+    if (geteuid() == 0) {
+        return "/etc/vpcd";
     }
-#else
+#endif
+
     const char *base = getenv("HOME");
     if (base && *base && buf && cap > 0) {
         snprintf(buf, cap, "%s/%s", base, DEFAULT_KEY_DIR);
         return buf;
     }
-#endif
     return DEFAULT_KEY_DIR;
 }
 
@@ -789,10 +797,19 @@ static int do_handshake(SOCKET *out_sock)
         return -1;
     }
 
+    if (load_pairing_id(pairing_id, sizeof pairing_id) != 0) {
+        if (generate_random_id(pairing_id, sizeof pairing_id) != 0) {
+            fprintf(stderr, "Failed to generate pairing_id.\n");
+            return -1;
+        }
+        persist_pairing_id(pairing_id);
+    }
+
     if (get_device_id(device_id, sizeof device_id) != 0) {
         fprintf(stderr, "Failed to load or create device_id.\n");
         return -1;
     }
+    persist_device_id(device_id);
 
     if (ensure_keypair(public_key_hex, sizeof public_key_hex) != 0) {
         fprintf(stderr, "Failed to create or load keypair.\n");
@@ -905,6 +922,62 @@ cleanup:
     return rc;
 }
 
+static int read_file_line(const char *path, char *out, size_t cap)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    if (!fgets(out, (int) cap, f)) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    trim_newline(out);
+    return out[0] ? 0 : -1;
+}
+
+static int write_file_line(const char *path, const char *value)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "%s\n", value);
+    fclose(f);
+#ifndef _WIN32
+    chmod(path, 0600);
+#endif
+    return 0;
+}
+
+static int persist_pairing_id(const char *id)
+{
+    char dir_buf[512];
+    char path[600];
+    const char *dir = key_dir_path(dir_buf, sizeof dir_buf);
+    if (snprintf(path, sizeof path, "%s/%s", dir, PAIRING_ID_FILE) < 0)
+        return -1;
+    return write_file_line(path, id);
+}
+
+static int load_pairing_id(char *out, size_t cap)
+{
+    char dir_buf[512];
+    char path[600];
+    const char *dir = key_dir_path(dir_buf, sizeof dir_buf);
+    if (snprintf(path, sizeof path, "%s/%s", dir, PAIRING_ID_FILE) < 0)
+        return -1;
+    return read_file_line(path, out, cap);
+}
+
+static int persist_device_id(const char *id)
+{
+    char dir_buf[512];
+    char path[600];
+    const char *dir = key_dir_path(dir_buf, sizeof dir_buf);
+    if (snprintf(path, sizeof path, "%s/%s", dir, DEVICE_ID_FILE) < 0)
+        return -1;
+    return write_file_line(path, id);
+}
+
+
 int main ( int argc , char *argv[] )
 {
     char slot;
@@ -929,6 +1002,7 @@ int main ( int argc , char *argv[] )
         fail = 1;
         goto err;
     }
+
 
     for (slot = 0; slot < VICC_MAX_SLOTS; slot++) {
         port = VPCDPORT+slot;

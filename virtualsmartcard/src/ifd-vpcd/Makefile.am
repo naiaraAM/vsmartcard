@@ -3,7 +3,7 @@ IFDVPCD_LIB = $(LIB_PREFIX)ifdvpcd.$(DYN_LIB_EXT)
 libifdvpcd_la_SOURCES = ifd-vpcd.c
 libifdvpcd_la_LDFLAGS = -no-undefined
 libifdvpcd_la_CPPFLAGS = $(PCSC_CFLAGS) -I$(srcdir)/../vpcd
-libifdvpcd_la_LIBADD = $(top_builddir)/src/vpcd/libvpcd.la
+libifdvpcd_la_LIBADD = $(top_builddir)/src/vpcd/libvpcd.la -lcrypto
 
 noinst_HEADERS = ifd-vpcd.h
 

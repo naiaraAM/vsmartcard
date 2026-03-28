@@ -37,6 +37,7 @@
 typedef WORD uint16_t;
 #else
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h> /* for TCP_NODELAY */
@@ -54,6 +55,548 @@ typedef WORD uint16_t;
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <openssl/crypto.h>
+
+#define NONCE_LEN 12
+#define TAG_LEN 16
+
+#define DEFAULT_KEY_DIR ".config/vpcd"
+#define SHARED_SECRET_FILE "vpcd_shared_secret.hex"
+#define PAIRING_ID_FILE "vpcd_pairing_id.hex"
+#define DEVICE_ID_FILE  "vpcd_device_id.hex"
+
+static int read_key_file_any(const char *filename, char *out, size_t cap);
+
+static void trim_newline(char *s)
+{
+    size_t n;
+    if (!s)
+        return;
+    n = strlen(s);
+    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
+        s[n - 1] = '\0';
+        n--;
+    }
+}
+
+static int hex_nibble(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F')
+        return 10 + (c - 'A');
+    return -1;
+}
+
+static int hex_to_bytes(const char *hex, unsigned char *out, size_t out_cap, size_t *out_len)
+{
+    size_t len;
+    if (!hex || !out)
+        return -1;
+    len = strlen(hex);
+    if ((len % 2) != 0)
+        return -1;
+    if ((len / 2) > out_cap)
+        return -1;
+    for (size_t i = 0; i < len / 2; i++) {
+        int hi = hex_nibble((unsigned char) hex[i * 2]);
+        int lo = hex_nibble((unsigned char) hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0)
+            return -1;
+        out[i] = (unsigned char) ((hi << 4) | lo);
+    }
+    if (out_len)
+        *out_len = len / 2;
+    return 0;
+}
+
+static const char *key_dir_path(char *buf, size_t cap)
+{
+    const char *env = getenv("VPCD_KEY_DIR");
+    if (env && *env)
+        return env;
+#ifdef _WIN32
+    const char *base = getenv("APPDATA");
+    if (base && *base && buf && cap > 0) {
+        snprintf(buf, cap, "%s\\%s", base, DEFAULT_KEY_DIR);
+        return buf;
+    }
+#else
+    if (geteuid() == 0) {
+        return "/etc/vpcd";
+    }
+    const char *base = getenv("HOME");
+    if (base && *base && buf && cap > 0) {
+        snprintf(buf, cap, "%s/%s", base, DEFAULT_KEY_DIR);
+        return buf;
+    }
+#endif
+    return DEFAULT_KEY_DIR;
+}
+
+static int load_shared_secret(struct vicc_ctx *ctx)
+{
+    char line[256];
+
+    if (!ctx)
+        return -1;
+
+    if (read_key_file_any(SHARED_SECRET_FILE, line, sizeof line) != 0) {
+        fprintf(stderr, "Shared secret not found. Run vpcd-config first.\n");
+        return -1;
+    }
+
+    trim_newline(line);
+    if (hex_to_bytes(line, ctx->shared_secret, sizeof ctx->shared_secret, &ctx->shared_secret_length) != 0) {
+        fprintf(stderr, "Invalid shared secret hex\n");
+        return -1;
+    }
+    if (ctx->shared_secret_length != 32) {
+        fprintf(stderr, "Shared secret length invalid (expected 32 bytes)\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int load_ids_from_env(struct vicc_ctx *ctx)
+{
+    const char *pairing = getenv("VPCD_PAIRING_ID");
+    const char *device = getenv("VPCD_DEVICE_ID");
+
+    if (!pairing || !*pairing || !device || !*device) {
+        fprintf(stderr, "Missing VPCD_PAIRING_ID or VPCD_DEVICE_ID\n");
+        return -1;
+    }
+
+    snprintf(ctx->pairing_id, sizeof ctx->pairing_id, "%s", pairing);
+    snprintf(ctx->device_id, sizeof ctx->device_id, "%s", device);
+    return 0;
+}
+
+static int recv_line(SOCKET sock, char *out, size_t cap)
+{
+    size_t used = 0;
+    if (!out || cap == 0)
+        return -1;
+
+    while (used < cap - 1) {
+        char c = 0;
+        int n = recv(sock, &c, 1, 0);
+        if (n <= 0)
+            break;
+        if (c == '\n')
+            break;
+        out[used++] = c;
+    }
+
+    out[used] = '\0';
+    if (used == 0)
+        return -1;
+    return 0;
+}
+
+static int send_line(SOCKET sock, const char *s)
+{
+    size_t len = strlen(s);
+    if (send(sock, s, (int) len, 0) < 0)
+        return -1;
+    if (send(sock, "\n", 1, 0) < 0)
+        return -1;
+    return 0;
+}
+
+static int extract_json_string(const char *json, const char *key, char *out, size_t cap)
+{
+    char pattern[64];
+    const char *p = NULL;
+    const char *end = NULL;
+    size_t len;
+
+    if (!json || !key || !out || cap == 0)
+        return -1;
+
+    if (snprintf(pattern, sizeof pattern, "\"%s\"", key) < 0)
+        return -1;
+    p = strstr(json, pattern);
+    if (!p)
+        return -1;
+    p += strlen(pattern);
+    while (*p && *p != ':')
+        p++;
+    if (*p != ':')
+        return -1;
+    p++;
+    while (*p && isspace((unsigned char) *p))
+        p++;
+    if (*p != '"')
+        return -1;
+    p++;
+    end = strchr(p, '"');
+    if (!end)
+        return -1;
+    len = (size_t) (end - p);
+    if (len + 1 > cap)
+        return -1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return 0;
+}
+
+static int parse_status_code(const char *json)
+{
+    const char *p = strstr(json, "\"status_code\"");
+    if (!p)
+        return -1;
+    p = strchr(p, ':');
+    if (!p)
+        return -1;
+    p++;
+    while (*p && isspace((unsigned char) *p))
+        p++;
+    errno = 0;
+    long code = strtol(p, NULL, 10);
+    if (errno != 0)
+        return -1;
+    return (int) code;
+}
+
+static int b64_encode(const unsigned char *in, size_t in_len, char *out, size_t out_cap)
+{
+    size_t need = 4 * ((in_len + 2) / 3) + 1;
+    if (out_cap < need)
+        return -1;
+    int n = EVP_EncodeBlock((unsigned char *) out, in, (int) in_len);
+    if (n <= 0)
+        return -1;
+    out[n] = '\0';
+    return 0;
+}
+
+static int b64_decode(const char *in, unsigned char *out, size_t out_cap, size_t *out_len)
+{
+    size_t len = strlen(in);
+    int pad = 0;
+    if (len >= 1 && in[len - 1] == '=') pad++;
+    if (len >= 2 && in[len - 2] == '=') pad++;
+    size_t need = (len / 4) * 3;
+    if (out_cap < need)
+        return -1;
+    int n = EVP_DecodeBlock(out, (const unsigned char *) in, (int) len);
+    if (n < 0)
+        return -1;
+    n -= pad;
+    if (n < 0)
+        return -1;
+    if (out_len)
+        *out_len = (size_t) n;
+    return 0;
+}
+
+static int encrypt_frame(struct vicc_ctx *ctx,
+                         const unsigned char *pt, size_t pt_len,
+                         char *out_b64, size_t out_cap)
+{
+    unsigned char nonce[NONCE_LEN];
+    unsigned char tag[TAG_LEN];
+    unsigned char *ct = NULL;
+    unsigned char *blob = NULL;
+    int len = 0, ct_len = 0;
+    int rc = -1;
+
+    if (!ctx || !pt || !out_b64)
+        return -1;
+
+    if (RAND_bytes(nonce, sizeof nonce) != 1) {
+        fprintf(stderr, "RAND_bytes failed\n");
+        return -1;
+    }
+
+    ct = (unsigned char *) malloc(pt_len);
+    if (!ct)
+        return -1;
+
+    EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
+    if (!c)
+        goto cleanup;
+
+    if (EVP_EncryptInit_ex(c, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1)
+        goto cleanup;
+    if (EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_IVLEN, NONCE_LEN, NULL) != 1)
+        goto cleanup;
+    if (EVP_EncryptInit_ex(c, NULL, NULL, ctx->shared_secret, nonce) != 1)
+        goto cleanup;
+
+    if (EVP_EncryptUpdate(c, ct, &len, pt, (int) pt_len) != 1)
+        goto cleanup;
+    ct_len = len;
+
+    if (EVP_EncryptFinal_ex(c, ct + ct_len, &len) != 1)
+        goto cleanup;
+    ct_len += len;
+
+    if (EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_GET_TAG, TAG_LEN, tag) != 1)
+        goto cleanup;
+
+    size_t total = NONCE_LEN + (size_t) ct_len + TAG_LEN;
+    blob = (unsigned char *) malloc(total);
+    if (!blob)
+        goto cleanup;
+
+    memcpy(blob, nonce, NONCE_LEN);
+    memcpy(blob + NONCE_LEN, ct, ct_len);
+    memcpy(blob + NONCE_LEN + ct_len, tag, TAG_LEN);
+
+    if (b64_encode(blob, total, out_b64, out_cap) != 0)
+        goto cleanup;
+
+    rc = 0;
+
+cleanup:
+    if (c)
+        EVP_CIPHER_CTX_free(c);
+    if (ct) {
+        OPENSSL_cleanse(ct, pt_len);
+        free(ct);
+    }
+    if (blob) {
+        OPENSSL_cleanse(blob, NONCE_LEN + pt_len + TAG_LEN);
+        free(blob);
+    }
+    return rc;
+}
+
+static int decrypt_frame(struct vicc_ctx *ctx,
+                         const char *b64,
+                         unsigned char **out, size_t *out_len)
+{
+    unsigned char *blob = NULL;
+    size_t blob_len = 0;
+    unsigned char *pt = NULL;
+    int len = 0, pt_len = 0;
+    int rc = -1;
+
+    if (!ctx || !b64 || !out || !out_len)
+        return -1;
+
+    size_t max_blob = (strlen(b64) / 4 + 1) * 3;
+    blob = (unsigned char *) malloc(max_blob);
+    if (!blob)
+        return -1;
+
+    if (b64_decode(b64, blob, max_blob, &blob_len) != 0)
+        goto cleanup;
+
+    if (blob_len < NONCE_LEN + TAG_LEN)
+        goto cleanup;
+
+    size_t ct_len = blob_len - NONCE_LEN - TAG_LEN;
+    unsigned char *nonce = blob;
+    unsigned char *ct = blob + NONCE_LEN;
+    unsigned char *tag = blob + NONCE_LEN + ct_len;
+
+    pt = (unsigned char *) malloc(ct_len);
+    if (!pt)
+        goto cleanup;
+
+    EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
+    if (!c)
+        goto cleanup;
+
+    if (EVP_DecryptInit_ex(c, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1)
+        goto cleanup;
+    if (EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_IVLEN, NONCE_LEN, NULL) != 1)
+        goto cleanup;
+    if (EVP_DecryptInit_ex(c, NULL, NULL, ctx->shared_secret, nonce) != 1)
+        goto cleanup;
+
+    if (EVP_DecryptUpdate(c, pt, &len, ct, (int) ct_len) != 1)
+        goto cleanup;
+    pt_len = len;
+
+    if (EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_TAG, TAG_LEN, tag) != 1)
+        goto cleanup;
+    if (EVP_DecryptFinal_ex(c, pt + pt_len, &len) != 1) {
+        EVP_CIPHER_CTX_free(c);
+        goto cleanup;
+    }
+    pt_len += len;
+    EVP_CIPHER_CTX_free(c);
+
+    *out = pt;
+    *out_len = (size_t) pt_len;
+    pt = NULL;
+
+    rc = 0;
+
+cleanup:
+    if (pt) {
+        OPENSSL_cleanse(pt, pt_len);
+        free(pt);
+    }
+    if (blob) {
+        OPENSSL_cleanse(blob, blob_len);
+        free(blob);
+    }
+    return rc;
+}
+
+static int mp_handshake(struct vicc_ctx *ctx)
+{
+    char msg[512];
+    char resp[512];
+
+    if (snprintf(msg, sizeof msg,
+            "{\"message_type\":\"handshake\",\"pairing_id\":\"%s\",\"device_id\":\"%s\",\"role\":\"pc\"}",
+            ctx->pairing_id, ctx->device_id) < 0) {
+        return -1;
+    }
+
+    if (send_line(ctx->client_sock, msg) != 0)
+        return -1;
+
+    if (recv_line(ctx->client_sock, resp, sizeof resp) != 0)
+        return -1;
+
+    int code = parse_status_code(resp);
+    if (code != 200) {
+        fprintf(stderr, "Handshake failed: %s\n", resp);
+        return -1;
+    }
+    return 0;
+}
+
+static int mp_send_comm(struct vicc_ctx *ctx, const char *payload_b64)
+{
+    char msg[4096];
+    if (snprintf(msg, sizeof msg,
+            "{\"message_type\":\"communication\",\"pairing_id\":\"%s\",\"source_id\":\"%s\",\"payload\":\"%s\"}",
+            ctx->pairing_id, ctx->device_id, payload_b64) < 0) {
+        return -1;
+    }
+    return send_line(ctx->client_sock, msg);
+}
+
+static int mp_wait_status(struct vicc_ctx *ctx)
+{
+    char line[512];
+    for (;;) {
+        if (recv_line(ctx->client_sock, line, sizeof line) != 0)
+            return -1;
+        int code = parse_status_code(line);
+        if (code < 0)
+            continue;
+        if (code != 200) {
+            fprintf(stderr, "Communication failed: %s\n", line);
+            return -1;
+        }
+        return 0;
+    }
+}
+
+static int mp_recv_payload(struct vicc_ctx *ctx, char *out, size_t cap)
+{
+    char line[4096];
+    for (;;) {
+        if (recv_line(ctx->client_sock, line, sizeof line) != 0)
+            return -1;
+
+        if (strstr(line, "\"status_code\"")) {
+            int code = parse_status_code(line);
+            if (code != 200)
+                return -1;
+            continue;
+        }
+
+        if (extract_json_string(line, "payload", out, cap) == 0)
+            return 0;
+    }
+}
+
+static int read_file_line(const char *path, char *out, size_t cap)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    if (!fgets(out, (int) cap, f)) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    trim_newline(out);
+    return out[0] ? 0 : -1;
+}
+
+static int read_key_file_any(const char *filename, char *out, size_t cap)
+{
+    char dir_buf[512];
+    char path[600];
+    const char *dir = key_dir_path(dir_buf, sizeof dir_buf);
+    if (snprintf(path, sizeof path, "%s/%s", dir, filename) >= 0) {
+        if (read_file_line(path, out, cap) == 0)
+            return 0;
+    }
+
+#ifndef _WIN32
+    if (geteuid() == 0) {
+        if (snprintf(path, sizeof path, "/root/%s/%s", DEFAULT_KEY_DIR, filename) >= 0) {
+            if (read_file_line(path, out, cap) == 0)
+                return 0;
+        }
+
+        DIR *d = opendir("/home");
+        if (d) {
+            struct dirent *ent = NULL;
+            while ((ent = readdir(d)) != NULL) {
+                if (ent->d_name[0] == '.')
+                    continue;
+                if (snprintf(path, sizeof path, "/home/%s/%s/%s",
+                             ent->d_name, DEFAULT_KEY_DIR, filename) < 0)
+                    continue;
+                if (read_file_line(path, out, cap) == 0) {
+                    closedir(d);
+                    return 0;
+                }
+            }
+            closedir(d);
+        }
+    }
+#endif
+
+    return -1;
+}
+
+static int load_pairing_id_file(char *out, size_t cap)
+{
+    return read_key_file_any(PAIRING_ID_FILE, out, cap);
+}
+
+static int load_device_id_file(char *out, size_t cap)
+{
+    return read_key_file_any(DEVICE_ID_FILE, out, cap);
+}
+
+static int load_ids(struct vicc_ctx *ctx)
+{
+    if (!ctx)
+        return -1;
+
+    if (load_pairing_id_file(ctx->pairing_id, sizeof ctx->pairing_id) != 0) {
+        fprintf(stderr, "pairing_id not found. Run vpcd-config first.\n");
+        return -1;
+    }
+
+    if (load_device_id_file(ctx->device_id, sizeof ctx->device_id) != 0) {
+        fprintf(stderr, "device_id not found. Run vpcd-config first.\n");
+        return -1;
+    }
+
+    return 0;
+}
 
 static ssize_t sendToVICC(struct vicc_ctx *ctx, size_t size, const unsigned char *buffer);
 static ssize_t recvFromVICC(struct vicc_ctx *ctx, unsigned char **buffer);
@@ -225,76 +768,89 @@ SOCKET waitforclient(SOCKET server, long secs, long usecs)
 
 static ssize_t sendToVICC(struct vicc_ctx *ctx, size_t length, const unsigned char* buffer)
 {
-    ssize_t r;
     uint16_t size;
-    char *sendBuffer;
+    unsigned char *plain = NULL;
+    char payload[4096];
 
     if (!ctx || length > 0xFFFF) {
         errno = EINVAL;
         return -1;
     }
 
-    /* allocate buffer for outgoing message */
-    sendBuffer = (char *) malloc(length + 2);
-    if (sendBuffer == NULL) {
+    plain = (unsigned char *) malloc(length + 2);
+    if (!plain) {
         errno = ENOMEM;
-	return -1;
+        return -1;
     }
 
-    /* send size of message on 2 bytes */
     size = htons((uint16_t) length);
-    memcpy(sendBuffer, &size, 2);
-    memcpy(sendBuffer + 2, buffer, length);
-    r = sendall(ctx->client_sock, sendBuffer, length + 2);
+    memcpy(plain, &size, 2);
+    memcpy(plain + 2, buffer, length);
 
-    if (r < 0)
-        vicc_eject(ctx);
+    if (encrypt_frame(ctx, plain, length + 2, payload, sizeof payload) != 0) {
+        free(plain);
+        return -1;
+    }
+    free(plain);
 
-    free(sendBuffer);
-    return r;
+    if (mp_send_comm(ctx, payload) != 0)
+        return -1;
+
+    if (mp_wait_status(ctx) != 0)
+        return -1;
+
+    return (ssize_t) (length + 2);
 }
 
 static ssize_t recvFromVICC(struct vicc_ctx *ctx, unsigned char **buffer)
 {
-    ssize_t r;
-    uint16_t size;
+    char payload[4096];
+    unsigned char *plain = NULL;
+    size_t plain_len = 0;
+    uint16_t size = 0;
     unsigned char *p = NULL;
 
-    if (!buffer || !ctx) {
+    if (!ctx || !buffer) {
         errno = EINVAL;
         return -1;
     }
 
-    /* receive size of message on 2 bytes */
-    r = recvall(ctx->client_sock, &size, sizeof size);
-    if (r < sizeof size)
-        return r;
+    if (mp_recv_payload(ctx, payload, sizeof payload) != 0)
+        return -1;
 
+    if (decrypt_frame(ctx, payload, &plain, &plain_len) != 0)
+        return -1;
+
+    if (plain_len < 2) {
+        free(plain);
+        return -1;
+    }
+
+    memcpy(&size, plain, 2);
     size = ntohs(size);
 
-    if (0 != size) {
+    if (size > 0) {
         p = realloc(*buffer, size);
         if (p == NULL) {
+            free(plain);
             errno = ENOMEM;
             return -1;
         }
         *buffer = p;
+        memcpy(*buffer, plain + 2, size);
     }
 
-    /* receive message */
-    return recvall(ctx->client_sock, *buffer, size);
+    free(plain);
+    return (ssize_t) size;
 }
 
 int vicc_eject(struct vicc_ctx *ctx)
 {
-    int r = 0;
     if (ctx && ctx->client_sock != INVALID_SOCKET) {
-        if (close(ctx->client_sock) < 0) {
-            r = -1;
-        }
+        close(ctx->client_sock);
         ctx->client_sock = INVALID_SOCKET;
     }
-    return r;
+    return 0;
 }
 
 struct vicc_ctx * vicc_init(const char *hostname, unsigned short port)
@@ -311,6 +867,7 @@ struct vicc_ctx * vicc_init(const char *hostname, unsigned short port)
     ctx->server_sock = INVALID_SOCKET;
     ctx->client_sock = INVALID_SOCKET;
     ctx->port = port;
+    ctx->shared_secret_length = 0;
 
 #ifdef _WIN32
     WSADATA wsaData;
@@ -322,18 +879,29 @@ struct vicc_ctx * vicc_init(const char *hostname, unsigned short port)
         goto err;
     }
 
-    if (hostname) {
-        ctx->hostname = strdup(hostname);
-        if (!ctx->hostname) {
-            goto err;
-        }
-        ctx->client_sock = connectsock(hostname, port);
-    } else {
-        ctx->server_sock = opensock(port);
-        if (ctx->server_sock == INVALID_SOCKET) {
-            goto err;
-        }
+    if (!hostname)
+        hostname = "middlepoint.test";
+
+    ctx->hostname = strdup(hostname);
+    if (!ctx->hostname) {
+        goto err;
     }
+
+    if (load_ids(ctx) != 0)
+        goto err;
+
+    if (load_shared_secret(ctx) != 0)
+        goto err;
+
+    ctx->client_sock = connectsock(ctx->hostname, ctx->port);
+    if (ctx->client_sock == INVALID_SOCKET) {
+        fprintf(stderr, "Failed to connect to middlepoint\n");
+        goto err;
+    }
+
+    if (mp_handshake(ctx) != 0)
+        goto err;
+
     r = ctx;
 
 err:
@@ -346,22 +914,19 @@ err:
 
 int vicc_exit(struct vicc_ctx *ctx)
 {
-    int r = vicc_eject(ctx);
+    int r = 0;
     if (ctx) {
         free_lock(ctx->io_lock);
         free(ctx->hostname);
-        if (ctx->server_sock != INVALID_SOCKET) {
-            ctx->server_sock = close(ctx->server_sock);
-            if (ctx->server_sock == INVALID_SOCKET) {
-                r = -1;
-            }
+        if (ctx->client_sock != INVALID_SOCKET) {
+            ctx->client_sock = close(ctx->client_sock);
         }
+        OPENSSL_cleanse(ctx->shared_secret, sizeof ctx->shared_secret);
         free(ctx);
 #ifdef _WIN32
         WSACleanup();
 #endif
     }
-
     return r;
 }
 
@@ -396,20 +961,17 @@ int vicc_connect(struct vicc_ctx *ctx, long secs, long usecs)
         return 0;
 
     if (ctx->client_sock == INVALID_SOCKET) {
-        if(!ctx->hostname) {
-            /* server mode, try to accept a client */
-            ctx->client_sock = waitforclient(ctx->server_sock, secs, usecs);
-        } else {
-            /* client mode, try to connect (again) */
-            ctx->client_sock = connectsock(ctx->hostname, ctx->port);
+        ctx->client_sock = connectsock(ctx->hostname, ctx->port);
+        if (ctx->client_sock == INVALID_SOCKET)
+            return 0;
+        if (mp_handshake(ctx) != 0) {
+            close(ctx->client_sock);
+            ctx->client_sock = INVALID_SOCKET;
+            return 0;
         }
     }
 
-    if (ctx->client_sock == INVALID_SOCKET)
-        /* not connected */
-        return 0;
-    else
-        return 1;
+    return 1;
 }
 
 int vicc_present(struct vicc_ctx *ctx) {

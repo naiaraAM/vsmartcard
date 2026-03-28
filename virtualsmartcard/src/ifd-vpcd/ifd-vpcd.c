@@ -32,6 +32,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <stdlib.h>
+
 #ifdef HAVE_ARPA_INET_H
 #include <arpa/inet.h>
 #endif
@@ -39,7 +41,8 @@
 /* pcscd allows at most 16 readers. Apple's SmartCardServices on OS X 10.10
  * freaks out if more than 8 slots are registered. We want only two slots... */
 #define VICC_MAX_SLOTS (VPCDSLOTS <= PCSCLITE_MAX_READERS_CONTEXTS ? VPCDSLOTS : PCSCLITE_MAX_READERS_CONTEXTS)
-const unsigned char vicc_max_slots = VICC_MAX_SLOTS;
+// Manually changed to JUST ONE
+const unsigned char vicc_max_slots = 1;
 
 #ifdef HAVE_DEBUGLOG_H
 
@@ -115,6 +118,54 @@ static struct vicc_ctx *ctx[VICC_MAX_SLOTS];
 const char *hostname = NULL;
 static const char openport[] = "/dev/null";
 
+
+// Globals
+static struct vicc_ctx *g_ctx = NULL;
+static int g_ctx_users = 0;
+static const char *g_mp_host = NULL;
+static unsigned short g_mp_port = 80;
+
+// Helpers
+static void vpcd_load_mp_defaults(void)
+{
+    const char *h = getenv("VPCD_MP_HOST");
+    const char *p = getenv("VPCD_MP_PORT");
+
+    g_mp_host = (h && *h) ? h : "middlepoint.test";
+    g_mp_port = 80;
+
+    if (p && *p) {
+        unsigned long v = strtoul(p, NULL, 10);
+        if (v > 0 && v < 65536)
+            g_mp_port = (unsigned short) v;
+    }
+}
+
+static void vpcd_ensure_ctx(void)
+{
+    if (g_ctx)
+        return;
+    vpcd_load_mp_defaults();
+    g_ctx = vicc_init(g_mp_host, g_mp_port);
+}
+
+#if defined(__GNUC__)
+__attribute__((constructor))
+static void vpcd_driver_ctor(void)
+{
+    vpcd_ensure_ctx();
+}
+
+__attribute__((destructor))
+static void vpcd_driver_dtor(void)
+{
+    if (g_ctx) {
+        vicc_exit(g_ctx);
+        g_ctx = NULL;
+    }
+}
+#endif
+
 RESPONSECODE
 IFDHCreateChannel (DWORD Lun, DWORD Channel)
 {
@@ -122,17 +173,15 @@ IFDHCreateChannel (DWORD Lun, DWORD Channel)
     if (slot >= vicc_max_slots) {
         return IFD_COMMUNICATION_ERROR;
     }
-    if (!hostname)
-        Log2(PCSC_LOG_INFO, "Waiting for virtual ICC on port %hu",
-                (unsigned short) (Channel+slot));
-    ctx[slot] = vicc_init(hostname, Channel+slot);
-    if (!ctx[slot]) {
-        Log1(PCSC_LOG_ERROR, "Could not initialize connection to virtual ICC");
+
+    vpcd_ensure_ctx();
+    if (!g_ctx) {
+        Log1(PCSC_LOG_ERROR, "Could not initialize connection to middlepoint");
         return IFD_COMMUNICATION_ERROR;
     }
-    if (hostname)
-        Log3(PCSC_LOG_INFO, "Connected to virtual ICC on %s port %hu",
-                hostname, (unsigned short) (Channel+slot));
+
+    ctx[slot] = g_ctx;
+    g_ctx_users++;
 
     return IFD_SUCCESS;
 }
@@ -241,11 +290,12 @@ IFDHCloseChannel (DWORD Lun)
     if (slot >= vicc_max_slots) {
         return IFD_COMMUNICATION_ERROR;
     }
-    if (vicc_exit(ctx[slot]) < 0) {
-        Log1(PCSC_LOG_ERROR, "Could not close connection to virtual ICC");
-        return IFD_COMMUNICATION_ERROR;
+
+    if (ctx[slot]) {
+        ctx[slot] = NULL;
+        if (g_ctx_users > 0)
+            g_ctx_users--;
     }
-    ctx[slot] = NULL;
 
     return IFD_SUCCESS;
 }

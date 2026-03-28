@@ -48,6 +48,11 @@ struct vicc_ctx {
         char *hostname;
         unsigned short port;
         void *io_lock;
+
+        char pairing_id[64];
+        char device_id[64];
+        unsigned char shared_secret[32];
+        size_t shared_secret_length;
 };
 
 #ifdef __cplusplus
