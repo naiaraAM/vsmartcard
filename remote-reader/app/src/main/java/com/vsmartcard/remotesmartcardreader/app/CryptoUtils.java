@@ -4,6 +4,7 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.preference.PreferenceManager;
 import android.util.Base64;
+import android.util.Log;
 
 import androidx.security.crypto.EncryptedSharedPreferences;
 import androidx.security.crypto.MasterKey; 
@@ -26,8 +27,10 @@ import org.conscrypt.Conscrypt;
  */
 public class CryptoUtils {
 
+    private static final String TAG =              "CryptoUtils";
     private static final String SEC_PREFS =         "crypto_prefs";
     private static final String PRIV_KEY =          "privkey_app";
+    private static final String PUB_KEY =           "pubkey_app";
 
     private CryptoUtils() {}
 
@@ -124,17 +127,26 @@ public class CryptoUtils {
      */
     public static String ensureAndStorePublicKey(Context ctx) throws Exception {
         SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(ctx);
-        String existing = sp.getString("pubkey_app", null);
+        String existing = sp.getString(PUB_KEY, null);
         if (existing != null && !existing.isEmpty()) {
-            return existing;
+            try {
+                PrivateKey priv = loadPrivateKey(ctx);
+                if (priv != null) {
+                    return existing;
+                }
+                Log.w(TAG, "Stored public key exists but private key is missing. Regenerating app keypair.");
+            } catch (Exception e) {
+                Log.w(TAG, "Stored app keypair is unusable. Regenerating app keypair.", e);
+            }
+            resetAppKeypair(ctx);
         }
 
         KeyPair kp = generateX25519KeyPair();
         byte[] pubRaw = getRawPublicKeyBytes(kp);
         String pubHex = bytesToHex(pubRaw);
-        sp.edit().putString("pubkey_app", pubHex).apply();
+        sp.edit().putString(PUB_KEY, pubHex).apply();
 
-        storePrivateKey(ctx,kp.getPrivate());
+        storePrivateKey(ctx, kp.getPrivate());
 
         return pubHex;
     }
@@ -155,10 +167,20 @@ public class CryptoUtils {
      * @throws Exception if secure preference initialization fails
      */
     private static SharedPreferences securePrefs(Context ctx) throws Exception {
+        try {
+            return createSecurePrefs(ctx);
+        } catch (Exception e) {
+            Log.w(TAG, "Secure preferences could not be opened. Resetting encrypted key storage.", e);
+            resetEncryptedKeyStorage(ctx);
+            return createSecurePrefs(ctx);
+        }
+    }
+
+    private static SharedPreferences createSecurePrefs(Context ctx) throws Exception {
         MasterKey masterKey = new MasterKey.Builder(ctx)
             .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
             .build();
-        
+
         return EncryptedSharedPreferences.create(
             ctx,
             SEC_PREFS,
@@ -194,12 +216,22 @@ public class CryptoUtils {
 
         SharedPreferences sp = securePrefs(ctx);
         String b64 = sp.getString(PRIV_KEY, null);
-        if (b64 == null) {
+        if (b64 == null || b64.isEmpty()) {
             return null;
         }
 
         byte[] pkcs8 = Base64.decode(b64, Base64.NO_WRAP);
         KeyFactory kf = KeyFactory.getInstance("X25519");
         return kf.generatePrivate(new PKCS8EncodedKeySpec(pkcs8));
+    }
+
+    private static void resetAppKeypair(Context ctx) {
+        resetEncryptedKeyStorage(ctx);
+        PreferenceManager.getDefaultSharedPreferences(ctx).edit().remove(PUB_KEY).apply();
+    }
+
+    private static void resetEncryptedKeyStorage(Context ctx) {
+        SharedPreferences raw = ctx.getSharedPreferences(SEC_PREFS, Context.MODE_PRIVATE);
+        raw.edit().clear().commit();
     }
 }

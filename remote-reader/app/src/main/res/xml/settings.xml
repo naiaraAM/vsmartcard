@@ -14,7 +14,7 @@
 
         <Preference
             android:title="Scan Configuration"
-            android:summary="Scan QR code from vpcd-config to import VPCD's hostname and port."
+            android:summary="Scan QR code from vpcd-config to import the pairing configuration."
             android:key="scan">
         </Preference>
 

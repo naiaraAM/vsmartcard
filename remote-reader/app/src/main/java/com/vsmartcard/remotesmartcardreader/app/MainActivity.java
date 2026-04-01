@@ -201,7 +201,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         final String hostname = SP.getString("hostname", VPCDWorker.DEFAULT_HOSTNAME);
         final boolean listen = SP.getBoolean("listen", VPCDWorker.DEFAULT_LISTEN);
         vpcdTest = new VPCDWorker();
-        vpcdTest.execute(new VPCDWorker.VPCDWorkerParams(hostname, port, scReader, listen));
+        vpcdTest.execute(new VPCDWorker.VPCDWorkerParams(hostname, port, scReader, listen, getApplicationContext()));
     }
 
     private void vpcdDisconnect() {

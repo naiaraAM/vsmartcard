@@ -19,7 +19,11 @@
 
 package com.vsmartcard.remotesmartcardreader.app;
 
+import android.content.Context;
+import android.content.SharedPreferences;
 import android.os.AsyncTask;
+import android.preference.PreferenceManager;
+import android.util.Base64;
 
 import androidx.annotation.Nullable;
 
@@ -35,9 +39,24 @@ import java.net.NetworkInterface;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.KeyFactory;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.security.SecureRandom;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.Arrays;
 import java.util.Enumeration;
 import java.util.LinkedList;
 import java.util.List;
+
+import javax.crypto.Cipher;
+import javax.crypto.KeyAgreement;
+import javax.crypto.Mac;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
 
 class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
 
@@ -46,17 +65,18 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
         final int port;
         final SCReader reader;
         final boolean listen;
-        VPCDWorkerParams(String hostname, int port, SCReader reader, boolean listen) {
+        final Context context;
+        VPCDWorkerParams(String hostname, int port, SCReader reader, boolean listen, Context context) {
             this.hostname = hostname;
             this.port = port;
             this.reader = reader;
             this.listen = listen;
+            this.context = context;
         }
     }
 
-    public static final int DEFAULT_PORT = 35963;
-    // default URI when used in emulator
-    public static final String DEFAULT_HOSTNAME = "10.0.2.2";
+    public static final int DEFAULT_PORT = 80;
+    public static final String DEFAULT_HOSTNAME = "middlepoint.test";
     public static final boolean DEFAULT_LISTEN = false;
 
     private SCReader reader;
@@ -64,6 +84,13 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
     private Socket socket;
     private InputStream inputStream;
     private OutputStream outputStream;
+    private byte[] sharedSecret;
+    private boolean secureMode = false;
+    private String pairingId;
+    private String deviceId;
+    private String pubKeyPcHex;
+    private String qrSecret;
+    private Context appContext;
 
     @Override
     protected void onCancelled () {
@@ -86,6 +113,7 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
     public Void doInBackground(VPCDWorkerParams... params) {
         try {
             reader = params[0].reader;
+            appContext = params[0].context != null ? params[0].context.getApplicationContext() : null;
             vpcdConnection(params[0]);
 
             while (!isCancelled()) {
@@ -148,6 +176,13 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
 
     @Nullable
     private byte[] receiveFromVPCD() throws IOException {
+        if (secureMode) {
+            try {
+                return receiveEncryptedFrame();
+            } catch (Exception e) {
+                throw new IOException("Failed to receive encrypted frame: " + e.getMessage(), e);
+            }
+        }
         /* convert length from network byte order.
         Note that Java always uses network byte order internally. */
         int length1 = inputStream.read();
@@ -175,6 +210,14 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
     }
 
     private void sendToVPCD(byte[] data) throws IOException {
+        if (secureMode) {
+            try {
+                sendEncryptedFrame(data);
+                return;
+            } catch (Exception e) {
+                throw new IOException("Failed to send encrypted frame: " + e.getMessage(), e);
+            }
+        }
         /* convert length to network byte order.
         Note that Java always uses network byte order internally. */
         byte[] packet = new byte[2 + data.length];
@@ -192,9 +235,24 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
             return;
         }
 
-        Log.i(this.getClass().getName(), "Connecting to " + params.hostname + ":" + params.port + "...");
-        vpcdConnect(params.hostname, params.port);
-        Log.i(this.getClass().getName(), "Connected to VPCD");
+        loadConfigFromPrefs();
+        try {
+            CryptoUtils.ensureConscrypt();
+            String pubKeyAppHex = CryptoUtils.ensureAndStorePublicKey(appContext);
+            byte[] pubKeyAppRaw = hexToBytes(pubKeyAppHex);
+            sharedSecret = deriveSharedSecret(pubKeyPcHex);
+
+            Log.i(this.getClass().getName(), "Connecting to " + params.hostname + ":" + params.port + "...");
+            vpcdConnect(params.hostname, params.port);
+            Log.i(this.getClass().getName(), "Connected to middlepoint");
+
+            performHandshake();
+            sendPairingMessage(pubKeyAppHex, pubKeyAppRaw);
+            secureMode = true;
+            Log.i(this.getClass().getName(), "Secure channel established");
+        } catch (Exception e) {
+            throw new IOException("Could not initialize secure channel: " + e.getMessage(), e);
+        }
     }
 
     private void vpcdListen(int port) throws IOException {
@@ -260,10 +318,20 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
 
     private void vpcdConnect(String hostname, int port) throws IOException {
         listenSocket = null;
-        socket = new Socket(InetAddress.getByName(hostname), port);
+        InetAddress address = resolveAddress(hostname);
+        Log.i(this.getClass().getName(), "Resolved " + hostname + " to " + address.getHostAddress());
+        socket = new Socket(address, port);
         socket.setTcpNoDelay(true);
         outputStream = socket.getOutputStream();
         inputStream = socket.getInputStream();
+    }
+
+    static InetAddress resolveAddress(String hostname) throws IOException {
+        try {
+            return InetAddress.getByName(hostname);
+        } catch (UnknownHostException e) {
+            throw new IOException("Could not resolve hostname '" + hostname + "'. Use a reachable IP or fix DNS.", e);
+        }
     }
 
     private void vpcdDisconnect() throws IOException {
@@ -278,6 +346,206 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
             Log.i(this.getClass().getName(), "Closing listening socket");
             listenSocket.close();
         }
+    }
+
+    private void loadConfigFromPrefs() throws IOException {
+        if (appContext == null) {
+            throw new IOException("Application context unavailable");
+        }
+        SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(appContext);
+        pairingId = sp.getString("pairing_id", null);
+        deviceId = sp.getString("device_id", null);
+        pubKeyPcHex = sp.getString("pubkey_pc", null);
+        qrSecret = sp.getString("qr_secret", null);
+        if (pairingId == null || pairingId.isEmpty()
+                || deviceId == null || deviceId.isEmpty()
+                || pubKeyPcHex == null || pubKeyPcHex.isEmpty()
+                || qrSecret == null || qrSecret.isEmpty()) {
+            throw new IOException("Missing pairing configuration, scan QR again.");
+        }
+    }
+
+    private static byte[] hexToBytes(String hex) {
+        if (hex == null) return null;
+        int len = hex.length();
+        if ((len % 2) != 0) {
+            throw new IllegalArgumentException("Hex string must have even length");
+        }
+        byte[] out = new byte[len / 2];
+        for (int i = 0; i < len; i += 2) {
+            out[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4)
+                    + Character.digit(hex.charAt(i + 1), 16));
+        }
+        return out;
+    }
+
+    private byte[] deriveSharedSecret(String peerHex) throws Exception {
+        byte[] peerRaw = hexToBytes(peerHex);
+        if (peerRaw == null || peerRaw.length != 32) {
+            throw new IllegalArgumentException("Invalid peer public key");
+        }
+        PrivateKey priv = CryptoUtils.loadPrivateKey(appContext);
+        if (priv == null) {
+            throw new IllegalStateException("Private key missing, rescan QR.");
+        }
+        PublicKey peer = decodeX25519PublicKey(peerRaw);
+        KeyAgreement ka = KeyAgreement.getInstance("X25519");
+        ka.init(priv);
+        ka.doPhase(peer, true);
+        return ka.generateSecret();
+    }
+
+    private PublicKey decodeX25519PublicKey(byte[] raw) throws Exception {
+        byte[] spki = new byte[12 + raw.length];
+        byte[] prefix = new byte[]{0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0x00};
+        System.arraycopy(prefix, 0, spki, 0, prefix.length);
+        System.arraycopy(raw, 0, spki, prefix.length, raw.length);
+        X509EncodedKeySpec spec = new X509EncodedKeySpec(spki);
+        KeyFactory kf = KeyFactory.getInstance("X25519");
+        return kf.generatePublic(spec);
+    }
+
+    private void performHandshake() throws IOException, GeneralSecurityException {
+        String msg = String.format("{\"message_type\":\"handshake\",\"pairing_id\":\"%s\",\"device_id\":\"%s\",\"role\":\"app\"}", pairingId, deviceId);
+        sendJsonLine(msg);
+        waitForStatusOk();
+    }
+
+    private void sendPairingMessage(String pubKeyAppHex, byte[] pubKeyAppRaw) throws Exception {
+        String macHex = computeMac(qrSecret, pubKeyAppRaw);
+        String payload = "mac=" + macHex + "&pubKeyApp=" + pubKeyAppHex;
+        String msg = String.format("{\"message_type\":\"communication\",\"pairing_id\":\"%s\",\"source_id\":\"%s\",\"payload\":\"%s\"}", pairingId, deviceId, payload);
+        sendJsonLine(msg);
+        waitForStatusOk();
+    }
+
+    private String computeMac(String secret, byte[] data) throws Exception {
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+        return CryptoUtils.bytesToHex(mac.doFinal(data));
+    }
+
+    private void sendJsonLine(String json) throws IOException {
+        byte[] bytes = (json + "\n").getBytes(StandardCharsets.UTF_8);
+        outputStream.write(bytes);
+        outputStream.flush();
+    }
+
+    private String readJsonLine() throws IOException {
+        StringBuilder sb = new StringBuilder();
+        int ch;
+        while ((ch = inputStream.read()) != -1) {
+            if (ch == '\n') {
+                break;
+            }
+            sb.append((char) ch);
+        }
+        if (sb.length() == 0 && ch == -1) {
+            return null;
+        }
+        return sb.toString().trim();
+    }
+
+    private void waitForStatusOk() throws IOException {
+        while (true) {
+            String line = readJsonLine();
+            if (line == null) {
+                throw new IOException("Connection closed while waiting for status");
+            }
+            if (line.isEmpty()) {
+                continue;
+            }
+            try {
+                org.json.JSONObject obj = new org.json.JSONObject(line);
+                if (obj.has("status_code")) {
+                    int code = obj.getInt("status_code");
+                    if (code != 200) {
+                        throw new IOException("Server returned status " + code);
+                    }
+                    return;
+                }
+            } catch (org.json.JSONException ignored) { }
+        }
+    }
+
+    private byte[] receiveEncryptedFrame() throws Exception {
+        while (true) {
+            String line = readJsonLine();
+            if (line == null) {
+                return null;
+            }
+            if (line.isEmpty()) {
+                continue;
+            }
+            try {
+                org.json.JSONObject obj = new org.json.JSONObject(line);
+                if (obj.has("status_code")) {
+                    int code = obj.getInt("status_code");
+                    if (code != 200) {
+                        throw new IOException("Received status " + code);
+                    }
+                    continue;
+                }
+                if (!obj.has("payload")) {
+                    continue;
+                }
+                String payload = obj.getString("payload");
+                byte[] plain = decryptPayload(payload);
+                if (plain == null || plain.length < 2) {
+                    throw new IOException("Invalid decrypted frame");
+                }
+                int length = ((plain[0] & 0xff) << 8) | (plain[1] & 0xff);
+                if (length > plain.length - 2) {
+                    throw new IOException("Frame length mismatch");
+                }
+                byte[] out = new byte[length];
+                System.arraycopy(plain, 2, out, 0, length);
+                return out;
+            } catch (org.json.JSONException ignored) { }
+        }
+    }
+
+    private void sendEncryptedFrame(byte[] data) throws Exception {
+        if (sharedSecret == null) {
+            throw new IllegalStateException("Shared secret not established");
+        }
+        byte[] plain = new byte[data.length + 2];
+        plain[0] = (byte) (data.length >> 8);
+        plain[1] = (byte) (data.length & 0xff);
+        System.arraycopy(data, 0, plain, 2, data.length);
+
+        String payload = encryptPayload(plain);
+        String msg = String.format("{\"message_type\":\"communication\",\"pairing_id\":\"%s\",\"source_id\":\"%s\",\"payload\":\"%s\"}", pairingId, deviceId, payload);
+        sendJsonLine(msg);
+        waitForStatusOk();
+    }
+
+    private String encryptPayload(byte[] plain) throws Exception {
+        byte[] nonce = new byte[12];
+        new SecureRandom().nextBytes(nonce);
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        GCMParameterSpec spec = new GCMParameterSpec(128, nonce);
+        SecretKeySpec keySpec = new SecretKeySpec(sharedSecret, "AES");
+        cipher.init(Cipher.ENCRYPT_MODE, keySpec, spec);
+        byte[] ct = cipher.doFinal(plain);
+        byte[] blob = new byte[nonce.length + ct.length];
+        System.arraycopy(nonce, 0, blob, 0, nonce.length);
+        System.arraycopy(ct, 0, blob, nonce.length, ct.length);
+        return Base64.encodeToString(blob, Base64.NO_WRAP);
+    }
+
+    private byte[] decryptPayload(String payload) throws Exception {
+        byte[] blob = Base64.decode(payload, Base64.DEFAULT);
+        if (blob.length < 12 + 16) {
+            throw new IOException("Ciphertext too short");
+        }
+        byte[] nonce = Arrays.copyOfRange(blob, 0, 12);
+        byte[] ct = Arrays.copyOfRange(blob, 12, blob.length);
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        GCMParameterSpec spec = new GCMParameterSpec(128, nonce);
+        SecretKeySpec keySpec = new SecretKeySpec(sharedSecret, "AES");
+        cipher.init(Cipher.DECRYPT_MODE, keySpec, spec);
+        return cipher.doFinal(ct);
     }
 
     /**
