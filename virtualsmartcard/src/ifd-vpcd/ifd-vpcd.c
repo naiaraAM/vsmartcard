@@ -22,6 +22,7 @@
 
 #include "ifd-vpcd.h"
 #include "vpcd.h"
+#include "lock.h"
 
 #include <wintypes.h>
 
@@ -33,6 +34,14 @@
 #include <string.h>
 
 #include <stdlib.h>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
+#ifdef HAVE_PTHREAD
+#include <pthread.h>
+#endif
 
 #ifdef HAVE_ARPA_INET_H
 #include <arpa/inet.h>
@@ -124,6 +133,13 @@ static struct vicc_ctx *g_ctx = NULL;
 static int g_ctx_users = 0;
 static const char *g_mp_host = NULL;
 static unsigned short g_mp_port = 80;
+static void *g_ctx_lock = NULL;
+
+#ifdef HAVE_PTHREAD
+static pthread_t g_ctx_thread;
+static volatile int g_ctx_thread_stop = 0;
+static int g_ctx_thread_started = 0;
+#endif
 
 // Helpers
 static void vpcd_load_mp_defaults(void)
@@ -141,27 +157,123 @@ static void vpcd_load_mp_defaults(void)
     }
 }
 
-static void vpcd_ensure_ctx(void)
+static void vpcd_refresh_ctx_locked(void)
 {
-    if (g_ctx)
+    if (g_ctx) {
+        if (g_ctx_users == 0 && g_ctx->client_sock == INVALID_SOCKET) {
+            (void) vicc_connect(g_ctx, 0, 0);
+        }
         return;
+    }
+
     vpcd_load_mp_defaults();
     g_ctx = vicc_init(g_mp_host, g_mp_port);
 }
+
+static void vpcd_ensure_ctx(void)
+{
+    if (!g_ctx_lock) {
+        g_ctx_lock = create_lock();
+        if (!g_ctx_lock)
+            return;
+    }
+
+    if (!lock(g_ctx_lock))
+        return;
+
+    vpcd_refresh_ctx_locked();
+    unlock(g_ctx_lock);
+}
+
+static struct vicc_ctx *vpcd_get_slot_ctx(size_t slot)
+{
+    struct vicc_ctx *slot_ctx = NULL;
+
+    if (slot >= vicc_max_slots) {
+        return NULL;
+    }
+
+    vpcd_ensure_ctx();
+
+    if (!g_ctx_lock || !lock(g_ctx_lock)) {
+        return NULL;
+    }
+
+    if (ctx[slot] == NULL && g_ctx != NULL) {
+        ctx[slot] = g_ctx;
+        g_ctx_users++;
+    }
+
+    slot_ctx = ctx[slot];
+    unlock(g_ctx_lock);
+    return slot_ctx;
+}
+
+#ifdef HAVE_PTHREAD
+static void *vpcd_keepalive_thread(void *unused)
+{
+    (void) unused;
+
+    while (!g_ctx_thread_stop) {
+        unsigned int delay = 1;
+        vpcd_ensure_ctx();
+        if (g_ctx_lock && lock(g_ctx_lock)) {
+            if (!g_ctx) {
+                delay = 5;
+            }
+            unlock(g_ctx_lock);
+        }
+        sleep(delay);
+    }
+
+    return NULL;
+}
+#endif
 
 #if defined(__GNUC__)
 __attribute__((constructor))
 static void vpcd_driver_ctor(void)
 {
+    if (!g_ctx_lock) {
+        g_ctx_lock = create_lock();
+    }
+
     vpcd_ensure_ctx();
+
+#ifdef HAVE_PTHREAD
+    if (!g_ctx_thread_started) {
+        g_ctx_thread_stop = 0;
+        if (pthread_create(&g_ctx_thread, NULL, vpcd_keepalive_thread, NULL) == 0) {
+            g_ctx_thread_started = 1;
+        } else {
+            Log1(PCSC_LOG_ERROR, "Could not start middlepoint keepalive thread");
+        }
+    }
+#endif
 }
 
 __attribute__((destructor))
 static void vpcd_driver_dtor(void)
 {
-    if (g_ctx) {
-        vicc_exit(g_ctx);
-        g_ctx = NULL;
+#ifdef HAVE_PTHREAD
+    if (g_ctx_thread_started) {
+        g_ctx_thread_stop = 1;
+        pthread_join(g_ctx_thread, NULL);
+        g_ctx_thread_started = 0;
+    }
+#endif
+
+    if (g_ctx_lock && lock(g_ctx_lock)) {
+        if (g_ctx) {
+            vicc_exit(g_ctx);
+            g_ctx = NULL;
+        }
+        unlock(g_ctx_lock);
+    }
+
+    if (g_ctx_lock) {
+        free_lock(g_ctx_lock);
+        g_ctx_lock = NULL;
     }
 }
 #endif
@@ -170,18 +282,15 @@ RESPONSECODE
 IFDHCreateChannel (DWORD Lun, DWORD Channel)
 {
     size_t slot = Lun & 0xffff;
+    (void) Channel;
+
     if (slot >= vicc_max_slots) {
         return IFD_COMMUNICATION_ERROR;
     }
 
-    vpcd_ensure_ctx();
-    if (!g_ctx) {
-        Log1(PCSC_LOG_ERROR, "Could not initialize connection to middlepoint");
-        return IFD_COMMUNICATION_ERROR;
+    if (!vpcd_get_slot_ctx(slot)) {
+        Log1(PCSC_LOG_INFO, "Middlepoint is not ready yet, reader will retry lazily");
     }
-
-    ctx[slot] = g_ctx;
-    g_ctx_users++;
 
     return IFD_SUCCESS;
 }
@@ -291,10 +400,13 @@ IFDHCloseChannel (DWORD Lun)
         return IFD_COMMUNICATION_ERROR;
     }
 
-    if (ctx[slot]) {
-        ctx[slot] = NULL;
-        if (g_ctx_users > 0)
-            g_ctx_users--;
+    if (g_ctx_lock && lock(g_ctx_lock)) {
+        if (ctx[slot]) {
+            ctx[slot] = NULL;
+            if (g_ctx_users > 0)
+                g_ctx_users--;
+        }
+        unlock(g_ctx_lock);
     }
 
     return IFD_SUCCESS;
@@ -306,6 +418,7 @@ IFDHGetCapabilities (DWORD Lun, DWORD Tag, PDWORD Length, PUCHAR Value)
     unsigned char *atr = NULL;
     ssize_t size;
     size_t slot = Lun & 0xffff;
+    struct vicc_ctx *slot_ctx = NULL;
     RESPONSECODE r = IFD_COMMUNICATION_ERROR;
 
     if (slot >= vicc_max_slots)
@@ -323,8 +436,13 @@ IFDHGetCapabilities (DWORD Lun, DWORD Tag, PDWORD Length, PUCHAR Value)
             /* fall through */
 #endif
         case TAG_IFD_ATR:
+            slot_ctx = vpcd_get_slot_ctx(slot);
+            if (!slot_ctx) {
+                Log1(PCSC_LOG_INFO, "Middlepoint is not ready yet, ATR unavailable");
+                goto err;
+            }
 
-            size = vicc_getatr(ctx[slot], &atr);
+            size = vicc_getatr(slot_ctx, &atr);
             if (size < 0) {
                 Log1(PCSC_LOG_ERROR, "could not get ATR");
                 goto err;
@@ -424,15 +542,22 @@ RESPONSECODE
 IFDHPowerICC (DWORD Lun, DWORD Action, PUCHAR Atr, PDWORD AtrLength)
 {
     size_t slot = Lun & 0xffff;
+    struct vicc_ctx *slot_ctx = NULL;
     RESPONSECODE r = IFD_COMMUNICATION_ERROR;
 
     if (slot >= vicc_max_slots) {
         goto err;
     }
 
+    slot_ctx = vpcd_get_slot_ctx(slot);
+    if (!slot_ctx) {
+        Log1(PCSC_LOG_INFO, "Middlepoint is not ready yet, cannot power ICC");
+        goto err;
+    }
+
     switch (Action) {
         case IFD_POWER_DOWN:
-            if (vicc_poweroff(ctx[slot]) < 0) {
+            if (vicc_poweroff(slot_ctx) < 0) {
                 Log1(PCSC_LOG_ERROR, "could not powerdown");
                 goto err;
             }
@@ -444,13 +569,13 @@ IFDHPowerICC (DWORD Lun, DWORD Action, PUCHAR Atr, PDWORD AtrLength)
 #endif
             return IFD_SUCCESS;
         case IFD_POWER_UP:
-            if (vicc_poweron(ctx[slot]) < 0) {
+            if (vicc_poweron(slot_ctx) < 0) {
                 Log1(PCSC_LOG_ERROR, "could not powerup");
                 goto err;
             }
             break;
         case IFD_RESET:
-            if (vicc_reset(ctx[slot]) < 0) {
+            if (vicc_reset(slot_ctx) < 0) {
                 Log1(PCSC_LOG_ERROR, "could not reset");
                 goto err;
             }
@@ -481,6 +606,7 @@ IFDHTransmitToICC (DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer,
     ssize_t size;
     RESPONSECODE r = IFD_COMMUNICATION_ERROR;
     size_t slot = Lun & 0xffff;
+    struct vicc_ctx *slot_ctx = NULL;
 
     if (slot >= vicc_max_slots) {
         goto err;
@@ -491,7 +617,13 @@ IFDHTransmitToICC (DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer,
         goto err;
     }
 
-    size = vicc_transmit(ctx[slot], TxLength, TxBuffer, &rapdu);
+    slot_ctx = vpcd_get_slot_ctx(slot);
+    if (!slot_ctx) {
+        Log1(PCSC_LOG_INFO, "Middlepoint is not ready yet, cannot transmit APDU");
+        goto err;
+    }
+
+    size = vicc_transmit(slot_ctx, TxLength, TxBuffer, &rapdu);
 
     if (size < 0) {
         Log1(PCSC_LOG_ERROR, "could not send apdu or receive rapdu");
@@ -522,10 +654,17 @@ RESPONSECODE
 IFDHICCPresence (DWORD Lun)
 {
     size_t slot = Lun & 0xffff;
+    struct vicc_ctx *slot_ctx = NULL;
     if (slot >= vicc_max_slots) {
         return IFD_COMMUNICATION_ERROR;
     }
-    switch (vicc_present(ctx[slot])) {
+
+    slot_ctx = vpcd_get_slot_ctx(slot);
+    if (!slot_ctx) {
+        return IFD_ICC_NOT_PRESENT;
+    }
+
+    switch (vicc_present(slot_ctx)) {
         case 0:
             return IFD_ICC_NOT_PRESENT;
         case 1:

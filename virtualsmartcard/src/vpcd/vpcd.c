@@ -46,7 +46,6 @@ typedef WORD uint16_t;
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
-#define INVALID_SOCKET -1
 #endif
 
 

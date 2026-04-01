@@ -238,8 +238,7 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
         loadConfigFromPrefs();
         try {
             CryptoUtils.ensureConscrypt();
-            String pubKeyAppHex = CryptoUtils.ensureAndStorePublicKey(appContext);
-            byte[] pubKeyAppRaw = hexToBytes(pubKeyAppHex);
+            CryptoUtils.ensureAndStorePublicKey(appContext);
             sharedSecret = deriveSharedSecret(pubKeyPcHex);
 
             Log.i(this.getClass().getName(), "Connecting to " + params.hostname + ":" + params.port + "...");
@@ -247,9 +246,8 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
             Log.i(this.getClass().getName(), "Connected to middlepoint");
 
             performHandshake();
-            sendPairingMessage(pubKeyAppHex, pubKeyAppRaw);
             secureMode = true;
-            Log.i(this.getClass().getName(), "Secure channel established");
+            Log.i(this.getClass().getName(), "Secure channel established with existing pairing");
         } catch (Exception e) {
             throw new IOException("Could not initialize secure channel: " + e.getMessage(), e);
         }

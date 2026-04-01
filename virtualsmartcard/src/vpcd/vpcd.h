@@ -26,6 +26,9 @@
 #ifdef _WIN32
 #include <stddef.h>
 #include <winsock2.h>
+#ifndef INVALID_SOCKET
+#define INVALID_SOCKET ((SOCKET) ~0)
+#endif
 #ifndef HAVE_CONFIG_H
 /* we assume that ./configure has not defined ssize_t for us */
 typedef int ssize_t;
@@ -33,6 +36,9 @@ typedef int ssize_t;
 #else
 #define SOCKET int
 #include <unistd.h>
+#ifndef INVALID_SOCKET
+#define INVALID_SOCKET -1
+#endif
 #endif
 
 #define VPCD_CTRL_LEN 	1
