@@ -441,6 +441,9 @@ IFDHGetCapabilities (DWORD Lun, DWORD Tag, PDWORD Length, PUCHAR Value)
                 Log1(PCSC_LOG_INFO, "Middlepoint is not ready yet, ATR unavailable");
                 goto err;
             }
+            if (!vicc_connect(slot_ctx, 0, 0)) {
+                goto err;
+            }
 
             size = vicc_getatr(slot_ctx, &atr);
             if (size < 0) {
@@ -554,6 +557,9 @@ IFDHPowerICC (DWORD Lun, DWORD Action, PUCHAR Atr, PDWORD AtrLength)
         Log1(PCSC_LOG_INFO, "Middlepoint is not ready yet, cannot power ICC");
         goto err;
     }
+    if (!vicc_connect(slot_ctx, 0, 0)) {
+        goto err;
+    }
 
     switch (Action) {
         case IFD_POWER_DOWN:
@@ -620,6 +626,9 @@ IFDHTransmitToICC (DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer,
     slot_ctx = vpcd_get_slot_ctx(slot);
     if (!slot_ctx) {
         Log1(PCSC_LOG_INFO, "Middlepoint is not ready yet, cannot transmit APDU");
+        goto err;
+    }
+    if (!vicc_connect(slot_ctx, 0, 0)) {
         goto err;
     }
 

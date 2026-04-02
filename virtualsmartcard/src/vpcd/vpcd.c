@@ -141,24 +141,31 @@ static const char *key_dir_path(char *buf, size_t cap)
 static int load_shared_secret(struct vicc_ctx *ctx)
 {
     char line[256];
+    size_t shared_secret_length = 0;
 
     if (!ctx)
         return -1;
 
+    OPENSSL_cleanse(ctx->shared_secret, sizeof ctx->shared_secret);
+    ctx->shared_secret_length = 0;
+
     if (read_key_file_any(SHARED_SECRET_FILE, line, sizeof line) != 0) {
-        fprintf(stderr, "Shared secret not found. Run vpcd-config first.\n");
         return -1;
     }
 
     trim_newline(line);
-    if (hex_to_bytes(line, ctx->shared_secret, sizeof ctx->shared_secret, &ctx->shared_secret_length) != 0) {
+    if (hex_to_bytes(line, ctx->shared_secret, sizeof ctx->shared_secret, &shared_secret_length) != 0) {
+        OPENSSL_cleanse(ctx->shared_secret, sizeof ctx->shared_secret);
         fprintf(stderr, "Invalid shared secret hex\n");
         return -1;
     }
-    if (ctx->shared_secret_length != 32) {
+    if (shared_secret_length != 32) {
+        OPENSSL_cleanse(ctx->shared_secret, sizeof ctx->shared_secret);
         fprintf(stderr, "Shared secret length invalid (expected 32 bytes)\n");
         return -1;
     }
+
+    ctx->shared_secret_length = shared_secret_length;
 
     return 0;
 }
@@ -169,7 +176,6 @@ static int load_ids_from_env(struct vicc_ctx *ctx)
     const char *device = getenv("VPCD_DEVICE_ID");
 
     if (!pairing || !*pairing || !device || !*device) {
-        fprintf(stderr, "Missing VPCD_PAIRING_ID or VPCD_DEVICE_ID\n");
         return -1;
     }
 
@@ -584,17 +590,42 @@ static int load_ids(struct vicc_ctx *ctx)
     if (!ctx)
         return -1;
 
+    ctx->pairing_id[0] = '\0';
+    ctx->device_id[0] = '\0';
+
+    if (load_ids_from_env(ctx) == 0) {
+        return 0;
+    }
+
     if (load_pairing_id_file(ctx->pairing_id, sizeof ctx->pairing_id) != 0) {
-        fprintf(stderr, "pairing_id not found. Run vpcd-config first.\n");
         return -1;
     }
 
     if (load_device_id_file(ctx->device_id, sizeof ctx->device_id) != 0) {
-        fprintf(stderr, "device_id not found. Run vpcd-config first.\n");
+        ctx->pairing_id[0] = '\0';
+        ctx->device_id[0] = '\0';
         return -1;
     }
 
     return 0;
+}
+
+static int vicc_prepare(struct vicc_ctx *ctx)
+{
+    if (!ctx)
+        return 0;
+
+    if (!ctx->pairing_id[0] || !ctx->device_id[0]) {
+        if (load_ids(ctx) != 0)
+            return 0;
+    }
+
+    if (ctx->shared_secret_length != 32) {
+        if (load_shared_secret(ctx) != 0)
+            return 0;
+    }
+
+    return 1;
 }
 
 static ssize_t sendToVICC(struct vicc_ctx *ctx, size_t size, const unsigned char *buffer);
@@ -776,6 +807,11 @@ static ssize_t sendToVICC(struct vicc_ctx *ctx, size_t length, const unsigned ch
         return -1;
     }
 
+    if (!vicc_connect(ctx, 0, 0)) {
+        errno = ENOTCONN;
+        return -1;
+    }
+
     plain = (unsigned char *) malloc(length + 2);
     if (!plain) {
         errno = ENOMEM;
@@ -856,17 +892,14 @@ struct vicc_ctx * vicc_init(const char *hostname, unsigned short port)
 {
     struct vicc_ctx *r = NULL;
 
-    struct vicc_ctx *ctx = malloc(sizeof *ctx);
+    struct vicc_ctx *ctx = calloc(1, sizeof *ctx);
     if (!ctx) {
         goto err;
     }
 
-    ctx->hostname = NULL;
-    ctx->io_lock = NULL;
     ctx->server_sock = INVALID_SOCKET;
     ctx->client_sock = INVALID_SOCKET;
     ctx->port = port;
-    ctx->shared_secret_length = 0;
 
 #ifdef _WIN32
     WSADATA wsaData;
@@ -885,21 +918,6 @@ struct vicc_ctx * vicc_init(const char *hostname, unsigned short port)
     if (!ctx->hostname) {
         goto err;
     }
-
-    if (load_ids(ctx) != 0)
-        goto err;
-
-    if (load_shared_secret(ctx) != 0)
-        goto err;
-
-    ctx->client_sock = connectsock(ctx->hostname, ctx->port);
-    if (ctx->client_sock == INVALID_SOCKET) {
-        fprintf(stderr, "Failed to connect to middlepoint\n");
-        goto err;
-    }
-
-    if (mp_handshake(ctx) != 0)
-        goto err;
 
     r = ctx;
 
@@ -956,7 +974,13 @@ ssize_t vicc_transmit(struct vicc_ctx *ctx,
 
 int vicc_connect(struct vicc_ctx *ctx, long secs, long usecs)
 {
+    (void) secs;
+    (void) usecs;
+
     if (!ctx)
+        return 0;
+
+    if (!vicc_prepare(ctx))
         return 0;
 
     if (ctx->client_sock == INVALID_SOCKET) {
