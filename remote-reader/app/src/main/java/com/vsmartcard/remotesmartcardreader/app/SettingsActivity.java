@@ -288,6 +288,7 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
             editor.putString("pubkey_pc", pub_key_pc);
             editor.putString("pubkey_app", pubKeyApp);
             editor.putString("qr_secret", qr_secret);
+            editor.putBoolean("pairing_confirmed", false);
             if (hostname != null && !hostname.isEmpty()) {
                 editor.putString("hostname", hostname);
             }
@@ -300,9 +301,6 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
                     new VPCDPreferenceFragment()).commit();
 
             showMessage("Configuration imported");
-
-            // Intenta el emparejamiento inmediatamente usando los datos recién guardados
-            new PairingTask(getApplicationContext()).execute();
         } catch (Exception e) {
             Log.e(getClass().getName(), "Could not import configuration", e);
             showMessage("Could not import configuration");

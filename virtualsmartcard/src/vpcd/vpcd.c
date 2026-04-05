@@ -49,6 +49,7 @@ typedef WORD uint16_t;
 #endif
 
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -182,6 +183,92 @@ static int load_ids_from_env(struct vicc_ctx *ctx)
     snprintf(ctx->pairing_id, sizeof ctx->pairing_id, "%s", pairing);
     snprintf(ctx->device_id, sizeof ctx->device_id, "%s", device);
     return 0;
+}
+
+static int delete_state_file_at(const char *path)
+{
+    if (!path || !*path)
+        return -1;
+
+    if (remove(path) == 0 || errno == ENOENT)
+        return 0;
+
+    fprintf(stderr, "Failed to delete stale state file: %s\n", path);
+    return -1;
+}
+
+static int clear_state_file_any(const char *filename)
+{
+    char dir_buf[512];
+    char path[600];
+    const char *dir = key_dir_path(dir_buf, sizeof dir_buf);
+    int failed = 0;
+
+    if (snprintf(path, sizeof path, "%s/%s", dir, filename) < 0)
+        return -1;
+    if (delete_state_file_at(path) != 0)
+        failed = -1;
+
+#ifndef _WIN32
+    if (geteuid() == 0) {
+        if (snprintf(path, sizeof path, "/root/%s/%s", DEFAULT_KEY_DIR, filename) >= 0) {
+            if (delete_state_file_at(path) != 0)
+                failed = -1;
+        }
+
+        DIR *d = opendir("/home");
+        if (d) {
+            struct dirent *ent = NULL;
+            while ((ent = readdir(d)) != NULL) {
+                if (ent->d_name[0] == '.')
+                    continue;
+                if (snprintf(path, sizeof path, "/home/%s/%s/%s",
+                             ent->d_name, DEFAULT_KEY_DIR, filename) < 0)
+                    continue;
+                if (delete_state_file_at(path) != 0)
+                    failed = -1;
+            }
+            closedir(d);
+        }
+    }
+#endif
+
+    return failed;
+}
+
+static int clear_session_state(void)
+{
+    int failed = 0;
+
+    if (clear_state_file_any(PAIRING_ID_FILE) != 0)
+        failed = -1;
+    if (clear_state_file_any(SHARED_SECRET_FILE) != 0)
+        failed = -1;
+
+    return failed;
+}
+
+static int response_indicates_stale_pairing(const char *json)
+{
+    if (!json)
+        return 0;
+
+    return strstr(json, "is not complete yet") != NULL ||
+           strstr(json, "No such pairing with ID") != NULL;
+}
+
+static void invalidate_stale_session(struct vicc_ctx *ctx)
+{
+    if (clear_session_state() == 0)
+        fprintf(stderr, "Cleared persisted stale pairing state.\n");
+
+    if (!ctx)
+        return;
+
+    ctx->pairing_id[0] = '\0';
+    ctx->device_id[0] = '\0';
+    OPENSSL_cleanse(ctx->shared_secret, sizeof ctx->shared_secret);
+    ctx->shared_secret_length = 0;
 }
 
 static int recv_line(SOCKET sock, char *out, size_t cap)
@@ -497,6 +584,8 @@ static int mp_wait_status(struct vicc_ctx *ctx)
         if (code < 0)
             continue;
         if (code != 200) {
+            if (response_indicates_stale_pairing(line))
+                invalidate_stale_session(ctx);
             fprintf(stderr, "Communication failed: %s\n", line);
             return -1;
         }
@@ -513,8 +602,11 @@ static int mp_recv_payload(struct vicc_ctx *ctx, char *out, size_t cap)
 
         if (strstr(line, "\"status_code\"")) {
             int code = parse_status_code(line);
-            if (code != 200)
+            if (code != 200) {
+                if (response_indicates_stale_pairing(line))
+                    invalidate_stale_session(ctx);
                 return -1;
+            }
             continue;
         }
 

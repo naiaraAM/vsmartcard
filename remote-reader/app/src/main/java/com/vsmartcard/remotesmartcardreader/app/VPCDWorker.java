@@ -238,7 +238,7 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
         loadConfigFromPrefs();
         try {
             CryptoUtils.ensureConscrypt();
-            CryptoUtils.ensureAndStorePublicKey(appContext);
+            String pubKeyAppHex = CryptoUtils.ensureAndStorePublicKey(appContext);
             sharedSecret = deriveSharedSecret(pubKeyPcHex);
 
             Log.i(this.getClass().getName(), "Connecting to " + params.hostname + ":" + params.port + "...");
@@ -246,6 +246,11 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
             Log.i(this.getClass().getName(), "Connected to middlepoint");
 
             performHandshake();
+            if (!isPairingConfirmed()) {
+                sendPairingMessage(pubKeyAppHex, hexToBytes(pubKeyAppHex));
+                setPairingConfirmed(true);
+                Log.i(this.getClass().getName(), "Pairing message delivered on persistent connection");
+            }
             secureMode = true;
             Log.i(this.getClass().getName(), "Secure channel established with existing pairing");
         } catch (Exception e) {
@@ -360,6 +365,24 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
                 || pubKeyPcHex == null || pubKeyPcHex.isEmpty()
                 || qrSecret == null || qrSecret.isEmpty()) {
             throw new IOException("Missing pairing configuration, scan QR again.");
+        }
+    }
+
+    private boolean isPairingConfirmed() throws IOException {
+        if (appContext == null) {
+            throw new IOException("Application context unavailable");
+        }
+        SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(appContext);
+        return sp.getBoolean("pairing_confirmed", true);
+    }
+
+    private void setPairingConfirmed(boolean confirmed) throws IOException {
+        if (appContext == null) {
+            throw new IOException("Application context unavailable");
+        }
+        SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(appContext);
+        if (!sp.edit().putBoolean("pairing_confirmed", confirmed).commit()) {
+            throw new IOException("Could not persist pairing state");
         }
     }
 

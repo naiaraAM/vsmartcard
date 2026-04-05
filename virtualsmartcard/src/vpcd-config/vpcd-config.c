@@ -40,6 +40,8 @@ static int write_file_line(const char *path, const char *value);
 static int persist_pairing_id(const char *id);
 static int load_pairing_id(char *out, size_t cap);
 static int persist_device_id(const char *id);
+static int delete_key_file(const char *filename);
+static int clear_session_state(void);
 
 #ifdef _WIN32
 #define VICC_MAX_SLOTS 1
@@ -792,18 +794,16 @@ static int do_handshake(SOCKET *out_sock)
     if (out_sock)
         *out_sock = INVALID_SOCKET;
 
+    if (clear_session_state() != 0) {
+        fprintf(stderr, "Failed to reset previous pairing state.\n");
+        return -1;
+    }
+
     if (generate_random_id(pairing_id, sizeof pairing_id) != 0) {
         fprintf(stderr, "Failed to generate pairing_id.\n");
         return -1;
     }
-
-    if (load_pairing_id(pairing_id, sizeof pairing_id) != 0) {
-        if (generate_random_id(pairing_id, sizeof pairing_id) != 0) {
-            fprintf(stderr, "Failed to generate pairing_id.\n");
-            return -1;
-        }
-        persist_pairing_id(pairing_id);
-    }
+    persist_pairing_id(pairing_id);
 
     if (get_device_id(device_id, sizeof device_id) != 0) {
         fprintf(stderr, "Failed to load or create device_id.\n");
@@ -975,6 +975,31 @@ static int persist_device_id(const char *id)
     if (snprintf(path, sizeof path, "%s/%s", dir, DEVICE_ID_FILE) < 0)
         return -1;
     return write_file_line(path, id);
+}
+
+static int delete_key_file(const char *filename)
+{
+    char dir_buf[512];
+    char path[600];
+    const char *dir = key_dir_path(dir_buf, sizeof dir_buf);
+
+    if (snprintf(path, sizeof path, "%s/%s", dir, filename) < 0)
+        return -1;
+
+    if (remove(path) == 0 || errno == ENOENT)
+        return 0;
+
+    fprintf(stderr, "Failed to delete stale state file: %s\n", path);
+    return -1;
+}
+
+static int clear_session_state(void)
+{
+    if (delete_key_file(PAIRING_ID_FILE) != 0)
+        return -1;
+    if (delete_key_file(SHARED_SECRET_FILE) != 0)
+        return -1;
+    return 0;
 }
 
 
