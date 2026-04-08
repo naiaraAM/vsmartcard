@@ -119,6 +119,7 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
             while (!isCancelled()) {
                 vpcdAccept();
                 byte[] out = null;
+                boolean disconnectAfterSend = false;
                 byte[] in = receiveFromVPCD();
                 if (in == null) {
                     if (listenSocket == null) {
@@ -139,7 +140,12 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
                             break;
                         case VPCD_CTRL_ON:
                             reader.powerOn();
-                            Log.i(this.getClass().getName(), "Powered up the card with ATR " + Hex.getHexString(reader.getATR()));
+                            byte[] atrOn = reader.getATR();
+                            if (atrOn != null) {
+                                Log.i(this.getClass().getName(), "Powered up the card with ATR " + Hex.getHexString(atrOn));
+                            } else {
+                                Log.i(this.getClass().getName(), "Powered up the card (ATR unavailable)");
+                            }
                             break;
                         case VPCD_CTRL_RESET:
                             reader.reset();
@@ -147,17 +153,34 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
                             break;
                         case VPCD_CTRL_ATR:
                             out = reader.getATR();
+                            if (out == null) {
+                                // Tag removed: reply with an empty frame so vpcd/pcscd won't block,
+                                // then disconnect to transition to 'no card'.
+                                out = new byte[0];
+                                disconnectAfterSend = true;
+                            }
                             break;
                         default:
                             throw new IOException("Unhandled command from VPCD.");
                     }
                 } else {
                     Log.i(this.getClass().getName(), "C-APDU: " + Hex.getHexString(in));
-                    out = reader.transmit(in);
-                    Log.i(this.getClass().getName(), "R-APDU: " + Hex.getHexString(out));
+                    try {
+                        out = reader.transmit(in);
+                        Log.i(this.getClass().getName(), "R-APDU: " + Hex.getHexString(out));
+                    } catch (IOException e) {
+                        // Most commonly TagLostException: card removed during APDU.
+                        Log.i(this.getClass().getName(), "Card I/O failed (card removed?): " + e.getMessage());
+                        out = new byte[0];
+                        disconnectAfterSend = true;
+                    }
                 }
                 if (out != null) {
                     sendToVPCD(out);
+                }
+
+                if (disconnectAfterSend) {
+                    break;
                 }
             }
         } catch (Exception e) {

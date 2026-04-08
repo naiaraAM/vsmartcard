@@ -110,6 +110,20 @@ public class NFCReader implements SCReader {
     /* generate the mapped ATR from 14443 data according to PC/SC part 3 section 3.1.3.2.3 */
     @Override
     public byte[] getATR() {
+        // IMPORTANT:
+        // pcscd/ifd-vpcd uses ATR requests as a card presence check.
+        // IsoDep.getHistoricalBytes() may still be available even after tag removal,
+        // so we must trigger a real RF exchange to detect TagLost.
+        try {
+            card.transceive(PRESENCE_PROBE_APDU);
+        } catch (IOException e) {
+            Log.i(this.getClass().getName(), "Tag lost while reading ATR: " + e.getMessage());
+            try {
+                eject();
+            } catch (IOException ignored) { }
+            return null;
+        }
+
         // for 14443 Type A, use the historical bytes returned as part of the ATS
         byte[] historicalBytes = card.getHistoricalBytes();
         if (historicalBytes == null) {
@@ -137,6 +151,10 @@ public class NFCReader implements SCReader {
 
         return atr;
     }
+
+    // Minimal APDU to force an RF exchange; if the card is removed, this will throw
+    // (TagLostException extends IOException).
+    private static final byte[] PRESENCE_PROBE_APDU = {(byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00};
 
     @Override
     public byte[] transmit(byte[] apdu) throws IOException {
