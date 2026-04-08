@@ -435,7 +435,7 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
     private void sendPairingMessage(String pubKeyAppHex, byte[] pubKeyAppRaw) throws Exception {
         String macHex = computeMac(qrSecret, pubKeyAppRaw);
         String payload = "mac=" + macHex + "&pubKeyApp=" + pubKeyAppHex;
-        String msg = String.format("{\"message_type\":\"communication\",\"pairing_id\":\"%s\",\"source_id\":\"%s\",\"payload\":\"%s\"}", pairingId, deviceId, payload);
+        String msg = String.format("{\"message_type\":\"communication\",\"source_id\":\"%s\",\"payload\":\"%s\"}", deviceId, payload);
         sendJsonLine(msg);
         waitForStatusOk();
     }
@@ -536,7 +536,7 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
         System.arraycopy(data, 0, plain, 2, data.length);
 
         String payload = encryptPayload(plain);
-        String msg = String.format("{\"message_type\":\"communication\",\"pairing_id\":\"%s\",\"source_id\":\"%s\",\"payload\":\"%s\"}", pairingId, deviceId, payload);
+        String msg = String.format("{\"message_type\":\"communication\",\"source_id\":\"%s\",\"payload\":\"%s\"}", deviceId, payload);
         sendJsonLine(msg);
         waitForStatusOk();
     }

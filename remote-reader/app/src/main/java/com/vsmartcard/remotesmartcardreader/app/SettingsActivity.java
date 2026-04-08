@@ -454,7 +454,7 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
 
                 String macHex = computeMac(qrSecret, pubKeyAppRaw);
                 String payload = "mac=" + macHex + "&pubKeyApp=" + pubKeyAppHex;
-                sendLine(out, String.format("{\"message_type\":\"communication\",\"pairing_id\":\"%s\",\"source_id\":\"%s\",\"payload\":\"%s\"}", pairingId, deviceId, payload));
+                sendLine(out, String.format("{\"message_type\":\"communication\",\"source_id\":\"%s\",\"payload\":\"%s\"}", deviceId, payload));
                 waitStatusOk(in);
 
                 Log.i(PairingTask.class.getName(), "Auto pairing succeeded; shared secret derived (" + secret.length + " bytes)");

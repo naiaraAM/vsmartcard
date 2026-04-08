@@ -567,8 +567,8 @@ static int mp_send_comm(struct vicc_ctx *ctx, const char *payload_b64)
 {
     char msg[4096];
     if (snprintf(msg, sizeof msg,
-            "{\"message_type\":\"communication\",\"pairing_id\":\"%s\",\"source_id\":\"%s\",\"payload\":\"%s\"}",
-            ctx->pairing_id, ctx->device_id, payload_b64) < 0) {
+            "{\"message_type\":\"communication\",\"source_id\":\"%s\",\"payload\":\"%s\"}",
+            ctx->device_id, payload_b64) < 0) {
         return -1;
     }
     return send_line(ctx->client_sock, msg);
