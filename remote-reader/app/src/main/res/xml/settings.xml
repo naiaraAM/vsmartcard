@@ -49,11 +49,6 @@
             android:summary="XXXXXXXXXXXXXXX" />
 
         <Preference
-            android:key="remote_id"
-            android:title="Remote PC ID"
-            android:summary="XXXXXXXXXXXXXXX" />
-
-        <Preference
             android:key="pubkey_pc"
             android:title="Public key remote PC"
             android:summary="XXXXXXXXXXXXXXX" />

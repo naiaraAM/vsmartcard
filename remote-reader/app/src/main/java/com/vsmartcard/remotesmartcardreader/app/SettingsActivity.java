@@ -152,6 +152,9 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
      * @see #sBindPreferenceSummaryToValueListener
      */
     private static void bindPreferenceSummaryToValue(Preference preference) {
+        if (preference == null) {
+            return;
+        }
         // Set the listener to watch for value changes.
         preference.setOnPreferenceChangeListener(sBindPreferenceSummaryToValueListener);
 
@@ -196,28 +199,31 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
             // add new fields
             bindPreferenceSummaryToValue(findPreference("pairing_id"));
             bindPreferenceSummaryToValue(findPreference("device_id"));
-            bindPreferenceSummaryToValue(findPreference("remote_id"));
             bindPreferenceSummaryToValue(findPreference("pubkey_pc"));
             bindPreferenceSummaryToValue(findPreference("pubkey_app"));
             bindPreferenceSummaryToValue(findPreference("qr_secret"));
 
 
             Preference nfcSettings = findPreference("nfcSettings");
-            nfcSettings.setOnPreferenceClickListener(new Preference.OnPreferenceClickListener() {
-                public boolean onPreferenceClick(Preference preference) {
-                    Intent viewIntent = new Intent(Settings.ACTION_NFC_SETTINGS);
-                    startActivity(viewIntent);
-                    return true;
-                }
-            });
+            if (nfcSettings != null) {
+                nfcSettings.setOnPreferenceClickListener(new Preference.OnPreferenceClickListener() {
+                    public boolean onPreferenceClick(Preference preference) {
+                        Intent viewIntent = new Intent(Settings.ACTION_NFC_SETTINGS);
+                        startActivity(viewIntent);
+                        return true;
+                    }
+                });
+            }
 
             Preference scan = findPreference("scan");
-            scan.setOnPreferenceClickListener(new Preference.OnPreferenceClickListener() {
-                public boolean onPreferenceClick(Preference preference) {
-                    IntentIntegrator.forFragment(VPCDPreferenceFragment.this).initiateScan();
-                    return true;
-                }
-            });
+            if (scan != null) {
+                scan.setOnPreferenceClickListener(new Preference.OnPreferenceClickListener() {
+                    public boolean onPreferenceClick(Preference preference) {
+                        IntentIntegrator.forFragment(VPCDPreferenceFragment.this).initiateScan();
+                        return true;
+                    }
+                });
+            }
         }
 
         @Override
@@ -264,16 +270,12 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
 
     private void handleScannedURI(Uri uri) {
         try {
-            String pairing_id, pc_id, pub_key_pc, qr_secret;
-            String hostname, port;
+            String pairing_id, pub_key_pc, qr_secret;
 
             // get fields by name
             pairing_id = getParam(uri, "pairing_id");
-            pc_id = getParam(uri, "pc_id");
             pub_key_pc = getParam(uri, "pubkey");
             qr_secret = getParam(uri, "qr_secret");
-            hostname = getFirstParam(uri, "hostname", "host");
-            port = getParam(uri, "port");
 
             CryptoUtils.ensureConscrypt();
             String deviceId = getOrCreateDeviceId(this);
@@ -284,17 +286,10 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
             SharedPreferences.Editor editor = SP.edit();
             editor.putString("pairing_id", pairing_id);
             editor.putString("device_id", deviceId);
-            editor.putString("remote_id", pc_id);
             editor.putString("pubkey_pc", pub_key_pc);
             editor.putString("pubkey_app", pubKeyApp);
             editor.putString("qr_secret", qr_secret);
             editor.putBoolean("pairing_confirmed", false);
-            if (hostname != null && !hostname.isEmpty()) {
-                editor.putString("hostname", hostname);
-            }
-            if (isValidPort(port)) {
-                editor.putString("port", port);
-            }
             editor.apply();
             
             getFragmentManager().beginTransaction().replace(android.R.id.content,
