@@ -1005,7 +1005,7 @@ static int clear_session_state(void)
 int main ( int argc , char *argv[] )
 {
     char slot;
-    char uri[512];
+    char uri[256];
     int fail = 0;
     SOCKET handshake_sock = INVALID_SOCKET;
 
@@ -1024,13 +1024,12 @@ int main ( int argc , char *argv[] )
 
     for (slot = 0; slot < VICC_MAX_SLOTS; slot++) {
         printf("Pairing ID:     %s\n", pairing_id);
-        printf("Device ID:      %s\n", device_id);
         printf("Public Key:     %s\n", public_key_hex);
         printf("QR Secret:      %s\n", qr_secret);
         printf("On your NFC phone with the Remote Smart Card Reader app scan this code:\n");
         int n = snprintf(uri, sizeof uri,
-                         "vpcd://pairing_id=%s&pc_id=%s&pubkey=%s&qr_secret=%s",
-                         pairing_id, device_id, public_key_hex, qr_secret);
+                         "vpcd://pairing_id=%s&pubkey=%s&qr_secret=%s",
+                         pairing_id, public_key_hex, qr_secret);
         if (n < 0) {
             fprintf(stderr, "Failed to build QR URI\n");
             continue;
