@@ -31,6 +31,7 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/pem.h>
+#include <openssl/rand.h>
 #include "vpcd.h"
 
 static int read_file_line(const char *path, char *out, size_t cap);
@@ -277,23 +278,13 @@ static int extract_pairing_fields(const char *json,
 
 static int random_u64(uint64_t *out)
 {
-#ifdef _WIN32
-    unsigned int r1 = 0, r2 = 0;
-    if (rand_s(&r1) != 0 || rand_s(&r2) != 0)
+    if (!out)
         return -1;
-    *out = ((uint64_t) r1 << 32) | r2;
+
+    /* Cryptographic RNG. Do not fall back to time/pid. */
+    if (RAND_bytes((unsigned char *) out, (int) sizeof(*out)) != 1)
+        return -1;
     return 0;
-#else
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd >= 0) {
-        ssize_t n = read(fd, out, sizeof(*out));
-        close(fd);
-        if (n == (ssize_t) sizeof(*out))
-            return 0;
-    }
-    *out = ((uint64_t) time(NULL) << 32) ^ (uint64_t) getpid();
-    return 0;
-#endif
 }
 
 static int generate_random_id(char *out, size_t cap)
@@ -671,17 +662,8 @@ static int ensure_qr_secret(char *out, size_t cap)
     if (snprintf(secret_path, sizeof secret_path, "%s/%s", dir, QR_SECRET_FILE) < 0)
         return -1;
 
-    f = fopen(secret_path, "r");
-    if (f) {
-        if (fgets(out, (int) cap, f) != NULL) {
-            trim_newline(out);
-            fclose(f);
-            if (out[0] != '\0')
-                return 0;
-        } else {
-            fclose(f);
-        }
-    }
+    /* Always generate a fresh QR secret for each new pairing session. */
+    out[0] = '\0';
 
     if (generate_random_id(out, cap) != 0) {
         fprintf(stderr, "Failed to generate qr_secret\n");
