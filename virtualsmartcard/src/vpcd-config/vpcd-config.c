@@ -33,7 +33,6 @@
 #include <openssl/pem.h>
 #include "vpcd.h"
 
-extern const char *local_ip (void);
 static int read_file_line(const char *path, char *out, size_t cap);
 static int write_file_line(const char *path, const char *value);
 
@@ -1007,8 +1006,7 @@ int main ( int argc , char *argv[] )
 {
     char slot;
     char uri[512];
-    const char *ip = NULL;
-    int fail = 0, port;
+    int fail = 0;
     SOCKET handshake_sock = INVALID_SOCKET;
 
     if (do_handshake(&handshake_sock) != 0) {
@@ -1016,11 +1014,6 @@ int main ( int argc , char *argv[] )
         goto err;
     }
 
-    ip = local_ip();
-    if (!ip) {
-        fail = 1;
-        goto err;
-    }
 
     if (ensure_qr_secret(qr_secret, sizeof qr_secret) != 0) {
         fprintf(stderr, "Failed to load or create qr_secret.\n");
@@ -1030,9 +1023,6 @@ int main ( int argc , char *argv[] )
 
 
     for (slot = 0; slot < VICC_MAX_SLOTS; slot++) {
-        port = VPCDPORT+slot;
-        printf("VPCD hostname:  %s\n", ip);
-        printf("VPCD port:      %d\n", port);
         printf("Pairing ID:     %s\n", pairing_id);
         printf("Device ID:      %s\n", device_id);
         printf("Public Key:     %s\n", public_key_hex);
