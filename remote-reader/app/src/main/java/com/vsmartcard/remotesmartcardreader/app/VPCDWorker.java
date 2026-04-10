@@ -42,19 +42,16 @@ import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
-import java.security.KeyFactory;
-import java.security.PrivateKey;
-import java.security.PublicKey;
 import java.security.SecureRandom;
-import java.security.spec.X509EncodedKeySpec;
+import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Enumeration;
+import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 
 import javax.crypto.Cipher;
-import javax.crypto.KeyAgreement;
-import javax.crypto.Mac;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
@@ -88,9 +85,11 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
     private boolean secureMode = false;
     private String pairingId;
     private String deviceId;
-    private String pubKeyPcHex;
     private String qrSecret;
+    private Spake2Plus.ProverConfig spake2PlusConfig;
+    private Spake2Plus.ProverSession spake2PlusSession;
     private Context appContext;
+    private final ArrayDeque<String> bufferedJsonLines = new ArrayDeque<>();
 
     @Override
     protected void onCancelled () {
@@ -206,6 +205,9 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
                 throw new IOException("Failed to receive encrypted frame: " + e.getMessage(), e);
             }
         }
+        if (listenSocket == null) {
+            throw new IOException("Secure channel not established yet");
+        }
         /* convert length from network byte order.
         Note that Java always uses network byte order internally. */
         int length1 = inputStream.read();
@@ -241,6 +243,9 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
                 throw new IOException("Failed to send encrypted frame: " + e.getMessage(), e);
             }
         }
+        if (listenSocket == null) {
+            throw new IOException("Secure channel not established yet");
+        }
         /* convert length to network byte order.
         Note that Java always uses network byte order internally. */
         byte[] packet = new byte[2 + data.length];
@@ -261,23 +266,165 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
         loadConfigFromPrefs();
         try {
             CryptoUtils.ensureConscrypt();
-            String pubKeyAppHex = CryptoUtils.ensureAndStorePublicKey(appContext);
-            sharedSecret = deriveSharedSecret(pubKeyPcHex);
+            Spake2Plus.ProverRegistration spake2PlusRegistration =
+                    Spake2Plus.deriveProverRegistration(CryptoUtils.hexToBytes(qrSecret), spake2PlusConfig);
+            spake2PlusSession = Spake2Plus.beginProverSession(spake2PlusRegistration);
 
             Log.i(this.getClass().getName(), "Connecting to " + params.hostname + ":" + params.port + "...");
             vpcdConnect(params.hostname, params.port);
             Log.i(this.getClass().getName(), "Connected to middlepoint");
 
             performHandshake();
-            if (!isPairingConfirmed()) {
-                sendPairingMessage(pubKeyAppHex, hexToBytes(pubKeyAppHex));
-                setPairingConfirmed(true);
-                Log.i(this.getClass().getName(), "Pairing message delivered on persistent connection");
+
+            restoreSharedSecretIfAvailable();
+            if (!isPairingConfirmed() || sharedSecret == null) {
+                completeSpake2PlusPairing();
             }
-            secureMode = true;
-            Log.i(this.getClass().getName(), "Secure channel established with existing pairing");
+
+            secureMode = sharedSecret != null;
+            if (!secureMode) {
+                throw new IOException("Secure channel could not be established");
+            }
+            Log.i(this.getClass().getName(), "Secure channel established");
         } catch (Exception e) {
             throw new IOException("Could not initialize secure channel: " + e.getMessage(), e);
+        }
+    }
+
+    private void restoreSharedSecretIfAvailable() {
+        if (appContext == null) {
+            return;
+        }
+        try {
+            if (!isPairingConfirmed()) {
+                return;
+            }
+            byte[] stored = CryptoUtils.loadSharedSecret(appContext);
+            if (stored != null && stored.length == 32) {
+                sharedSecret = stored;
+            }
+        } catch (Exception e) {
+            Log.w(this.getClass().getName(), "Could not restore shared secret, will re-pair: " + e.getMessage());
+            sharedSecret = null;
+        }
+    }
+
+    private void completeSpake2PlusPairing() throws Exception {
+        if (spake2PlusSession == null) {
+            throw new IllegalStateException("SPAKE2+ session not initialized");
+        }
+
+        setPairingConfirmed(false);
+        sendPairingMessage(spake2PlusSession.shareP);
+        Log.i(this.getClass().getName(), "Waiting for SPAKE2+ shareV/confirmV...");
+
+        byte[] shareV = null;
+        byte[] confirmV = null;
+
+        while (true) {
+            PayloadMessage msg = waitForPayloadMessage();
+            if (msg == null || msg.payload == null) {
+                continue;
+            }
+            Map<String, String> kv = parseKvPayload(msg.payload);
+            String shareVHex = kv.get("shareV");
+            String confirmVHex = kv.get("confirmV");
+            if (shareVHex == null || confirmVHex == null) {
+                continue;
+            }
+            shareV = CryptoUtils.hexToBytes(shareVHex);
+            confirmV = CryptoUtils.hexToBytes(confirmVHex);
+            break;
+        }
+
+        Spake2Plus.ProverResult result = Spake2Plus.finishProverSession(spake2PlusSession, shareV, confirmV);
+        sharedSecret = result.sharedKey;
+
+        sendPairingConfirmation(result.confirmP);
+        if (appContext != null) {
+            CryptoUtils.storeSharedSecret(appContext, sharedSecret);
+        }
+        setPairingConfirmed(true);
+
+        Arrays.fill(shareV, (byte) 0);
+        Arrays.fill(confirmV, (byte) 0);
+
+        Log.i(this.getClass().getName(), "SPAKE2+ pairing completed; shared secret derived");
+    }
+
+    private void sendPairingConfirmation(byte[] confirmP) throws Exception {
+        if (confirmP == null || confirmP.length == 0) {
+            throw new IllegalArgumentException("Missing SPAKE2+ confirmP");
+        }
+        String payload = "confirmP=" + CryptoUtils.bytesToHex(confirmP);
+        String msg = String.format(
+                "{\"message_type\":\"communication\",\"source_id\":\"%s\",\"payload\":\"%s\"}",
+                deviceId,
+                payload);
+        sendJsonLine(msg);
+        waitForStatusOk();
+    }
+
+    private static Map<String, String> parseKvPayload(String payload) {
+        Map<String, String> out = new HashMap<>();
+        if (payload == null || payload.isEmpty()) {
+            return out;
+        }
+
+        String[] parts = payload.split("&");
+        for (String part : parts) {
+            if (part == null || part.isEmpty()) {
+                continue;
+            }
+            int idx = part.indexOf('=');
+            if (idx <= 0) {
+                continue;
+            }
+            String key = part.substring(0, idx);
+            String value = part.substring(idx + 1);
+            if (!key.isEmpty()) {
+                out.put(key, value);
+            }
+        }
+        return out;
+    }
+
+    private static final class PayloadMessage {
+        final String sourceId;
+        final String payload;
+
+        private PayloadMessage(String sourceId, String payload) {
+            this.sourceId = sourceId;
+            this.payload = payload;
+        }
+    }
+
+    private PayloadMessage waitForPayloadMessage() throws IOException {
+        while (true) {
+            String line = readJsonLine();
+            if (line == null) {
+                throw new IOException("Connection closed while waiting for payload");
+            }
+            if (line.isEmpty()) {
+                continue;
+            }
+            try {
+                org.json.JSONObject obj = new org.json.JSONObject(line);
+                if (obj.has("status_code")) {
+                    int code = obj.getInt("status_code");
+                    if (code != 200) {
+                        String payload = obj.optString("payload", "");
+                        throw new IOException("Received status " + code + (payload.isEmpty() ? "" : (" payload=" + payload)));
+                    }
+                    continue;
+                }
+                if (!obj.has("payload")) {
+                    continue;
+                }
+                String payload = obj.getString("payload");
+                String sourceId = obj.optString("source_id", "");
+                return new PayloadMessage(sourceId, payload);
+            } catch (org.json.JSONException ignored) { }
         }
     }
 
@@ -381,13 +528,16 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
         SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(appContext);
         pairingId = sp.getString("pairing_id", null);
         deviceId = sp.getString("device_id", null);
-        pubKeyPcHex = sp.getString("pubkey_pc", null);
         qrSecret = sp.getString("qr_secret", null);
         if (pairingId == null || pairingId.isEmpty()
                 || deviceId == null || deviceId.isEmpty()
-                || pubKeyPcHex == null || pubKeyPcHex.isEmpty()
                 || qrSecret == null || qrSecret.isEmpty()) {
             throw new IOException("Missing pairing configuration, scan QR again.");
+        }
+        try {
+            spake2PlusConfig = Spake2Plus.buildProverConfig(deviceId, pairingId);
+        } catch (IllegalArgumentException e) {
+            throw new IOException("Invalid SPAKE2+ configuration: " + e.getMessage(), e);
         }
     }
 
@@ -409,64 +559,20 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
         }
     }
 
-    private static byte[] hexToBytes(String hex) {
-        if (hex == null) return null;
-        int len = hex.length();
-        if ((len % 2) != 0) {
-            throw new IllegalArgumentException("Hex string must have even length");
-        }
-        byte[] out = new byte[len / 2];
-        for (int i = 0; i < len; i += 2) {
-            out[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4)
-                    + Character.digit(hex.charAt(i + 1), 16));
-        }
-        return out;
-    }
-
-    private byte[] deriveSharedSecret(String peerHex) throws Exception {
-        byte[] peerRaw = hexToBytes(peerHex);
-        if (peerRaw == null || peerRaw.length != 32) {
-            throw new IllegalArgumentException("Invalid peer public key");
-        }
-        PrivateKey priv = CryptoUtils.loadPrivateKey(appContext);
-        if (priv == null) {
-            throw new IllegalStateException("Private key missing, rescan QR.");
-        }
-        PublicKey peer = decodeX25519PublicKey(peerRaw);
-        KeyAgreement ka = KeyAgreement.getInstance("X25519");
-        ka.init(priv);
-        ka.doPhase(peer, true);
-        return ka.generateSecret();
-    }
-
-    private PublicKey decodeX25519PublicKey(byte[] raw) throws Exception {
-        byte[] spki = new byte[12 + raw.length];
-        byte[] prefix = new byte[]{0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0x00};
-        System.arraycopy(prefix, 0, spki, 0, prefix.length);
-        System.arraycopy(raw, 0, spki, prefix.length, raw.length);
-        X509EncodedKeySpec spec = new X509EncodedKeySpec(spki);
-        KeyFactory kf = KeyFactory.getInstance("X25519");
-        return kf.generatePublic(spec);
-    }
-
     private void performHandshake() throws IOException, GeneralSecurityException {
         String msg = String.format("{\"message_type\":\"handshake\",\"pairing_id\":\"%s\",\"device_id\":\"%s\",\"role\":\"app\"}", pairingId, deviceId);
         sendJsonLine(msg);
         waitForStatusOk();
     }
 
-    private void sendPairingMessage(String pubKeyAppHex, byte[] pubKeyAppRaw) throws Exception {
-        String macHex = computeMac(qrSecret, pubKeyAppRaw);
-        String payload = "mac=" + macHex + "&pubKeyApp=" + pubKeyAppHex;
+    private void sendPairingMessage(byte[] shareP) throws Exception {
+        if (shareP == null || shareP.length == 0) {
+            throw new IllegalArgumentException("Missing SPAKE2+ shareP");
+        }
+        String payload = "shareP=" + CryptoUtils.bytesToHex(shareP);
         String msg = String.format("{\"message_type\":\"communication\",\"source_id\":\"%s\",\"payload\":\"%s\"}", deviceId, payload);
         sendJsonLine(msg);
         waitForStatusOk();
-    }
-
-    private String computeMac(String secret, byte[] data) throws Exception {
-        Mac mac = Mac.getInstance("HmacSHA256");
-        mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
-        return CryptoUtils.bytesToHex(mac.doFinal(data));
     }
 
     private void sendJsonLine(String json) throws IOException {
@@ -476,6 +582,13 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
     }
 
     private String readJsonLine() throws IOException {
+        if (!bufferedJsonLines.isEmpty()) {
+            return bufferedJsonLines.removeFirst();
+        }
+        return readJsonLineFromStream();
+    }
+
+    private String readJsonLineFromStream() throws IOException {
         StringBuilder sb = new StringBuilder();
         int ch;
         while ((ch = inputStream.read()) != -1) {
@@ -492,7 +605,7 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
 
     private void waitForStatusOk() throws IOException {
         while (true) {
-            String line = readJsonLine();
+            String line = readJsonLineFromStream();
             if (line == null) {
                 throw new IOException("Connection closed while waiting for status");
             }
@@ -504,10 +617,13 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
                 if (obj.has("status_code")) {
                     int code = obj.getInt("status_code");
                     if (code != 200) {
-                        throw new IOException("Server returned status " + code);
+                        String payload = obj.optString("payload", "");
+                        throw new IOException("Server returned status " + code + (payload.isEmpty() ? "" : (" payload=" + payload)));
                     }
                     return;
                 }
+                // Not a status response; buffer it so it can be processed later.
+                bufferedJsonLines.addLast(line);
             } catch (org.json.JSONException ignored) { }
         }
     }

@@ -27,11 +27,15 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <openssl/bn.h>
 #include <openssl/crypto.h>
+#include <openssl/ec.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <openssl/obj_mac.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
+#include <openssl/sha.h>
 #include "vpcd.h"
 
 static int read_file_line(const char *path, char *out, size_t cap);
@@ -74,6 +78,19 @@ static char pairing_id[64];
 static char public_key_hex[128];
 static char qr_secret[64];
 static char shared_secret_hex[128];
+
+#define SPAKE2PLUS_CONTEXT               "vsmartcard-spake2plus-v1"
+#define SPAKE2PLUS_CIPHERSUITE           "P-256-SHA256-HKDF-HMAC-SHA256"
+#define SPAKE2PLUS_REGISTRATION_INFO     "vsmartcard-spake2plus-registration-v1"
+#define SPAKE2PLUS_CONFIRMATION_INFO     "ConfirmationKeys"
+#define SPAKE2PLUS_SHARED_KEY_INFO       "SharedKey"
+#define SPAKE2PLUS_POINT_LEN             33
+#define SPAKE2PLUS_SCALAR_LEN            32
+#define SPAKE2PLUS_REG_HALF_LEN          40
+#define SPAKE2PLUS_REG_OUTPUT_LEN        (SPAKE2PLUS_REG_HALF_LEN * 2)
+#define SPAKE2PLUS_TRANSCRIPT_CAP        1024
+#define SPAKE2PLUS_P256_M_HEX            "02886e2f97ace46e55ba9dd7242579f2993b64e16ef3dcab95afd497333d8fa12f"
+#define SPAKE2PLUS_P256_N_HEX            "03d8bbd6c639c62937b04d997f38c3770719c629d7014d49a24b4f98baa1292b49"
 
 #ifdef _WIN32
 static int wsa_started = 0;
@@ -528,35 +545,619 @@ static int recv_json_line(SOCKET sock, char *out, size_t cap)
     return 0;
 }
 
-static int handle_pairing_message(const char *json, const char *qr_secret_str,
+static int append_bytes(unsigned char *buf, size_t cap, size_t *used,
+                        const unsigned char *data, size_t data_len)
+{
+    if (!buf || !used)
+        return -1;
+    if (*used > cap || data_len > (cap - *used))
+        return -1;
+    if (data_len > 0 && data)
+        memcpy(buf + *used, data, data_len);
+    *used += data_len;
+    return 0;
+}
+
+static int append_u64_le(unsigned char *buf, size_t cap, size_t *used, size_t value)
+{
+    unsigned char le[8];
+    for (size_t i = 0; i < sizeof le; i++) {
+        le[i] = (unsigned char) (value & 0xff);
+        value >>= 8;
+    }
+    return append_bytes(buf, cap, used, le, sizeof le);
+}
+
+static int append_len_prefixed(unsigned char *buf, size_t cap, size_t *used,
+                               const unsigned char *data, size_t data_len)
+{
+    if (append_u64_le(buf, cap, used, data_len) != 0)
+        return -1;
+    return append_bytes(buf, cap, used, data, data_len);
+}
+
+static int hmac_sha256_bytes(const unsigned char *key, size_t key_len,
+                             const unsigned char *data, size_t data_len,
+                             unsigned char *out, size_t out_cap, size_t *out_len)
+{
+    unsigned int hmac_len = 0;
+
+    if (!key || !out)
+        return -1;
+    if (!HMAC(EVP_sha256(), key, (int) key_len, data, data_len, out, &hmac_len))
+        return -1;
+    if (out_cap < hmac_len)
+        return -1;
+    if (out_len)
+        *out_len = hmac_len;
+    return 0;
+}
+
+static int hkdf_sha256(const unsigned char *salt, size_t salt_len,
+                       const unsigned char *ikm, size_t ikm_len,
+                       const unsigned char *info, size_t info_len,
+                       unsigned char *out, size_t out_len)
+{
+    unsigned char zero_salt[SHA256_DIGEST_LENGTH];
+    unsigned char prk[SHA256_DIGEST_LENGTH];
+    unsigned char prev[SHA256_DIGEST_LENGTH];
+    size_t prk_len = 0, prev_len = 0, used = 0;
+    unsigned char counter = 1;
+    int rc = -1;
+
+    memset(zero_salt, 0, sizeof zero_salt);
+    memset(prk, 0, sizeof prk);
+    memset(prev, 0, sizeof prev);
+
+    if (!ikm || !out)
+        return -1;
+
+    if (!salt || salt_len == 0) {
+        salt = zero_salt;
+        salt_len = sizeof zero_salt;
+    }
+
+    if (hmac_sha256_bytes(salt, salt_len, ikm, ikm_len, prk, sizeof prk, &prk_len) != 0)
+        goto cleanup;
+
+    while (used < out_len) {
+        unsigned char input[SHA256_DIGEST_LENGTH + 128];
+        unsigned char block[SHA256_DIGEST_LENGTH];
+        size_t input_len = 0;
+        size_t block_len = 0;
+        size_t chunk = 0;
+
+        if (prev_len > 0) {
+            memcpy(input + input_len, prev, prev_len);
+            input_len += prev_len;
+        }
+        if (info && info_len > 0) {
+            if (input_len + info_len > sizeof input)
+                goto cleanup;
+            memcpy(input + input_len, info, info_len);
+            input_len += info_len;
+        }
+        if (input_len + 1 > sizeof input)
+            goto cleanup;
+        input[input_len++] = counter++;
+
+        if (hmac_sha256_bytes(prk, prk_len, input, input_len, block, sizeof block, &block_len) != 0)
+            goto cleanup;
+
+        chunk = block_len;
+        if (chunk > (out_len - used))
+            chunk = out_len - used;
+        memcpy(out + used, block, chunk);
+        used += chunk;
+
+        memcpy(prev, block, block_len);
+        prev_len = block_len;
+        OPENSSL_cleanse(block, sizeof block);
+        OPENSSL_cleanse(input, sizeof input);
+    }
+
+    rc = 0;
+
+cleanup:
+    OPENSSL_cleanse(zero_salt, sizeof zero_salt);
+    OPENSSL_cleanse(prk, sizeof prk);
+    OPENSSL_cleanse(prev, sizeof prev);
+    return rc;
+}
+
+static int digest_sha256(const unsigned char *data, size_t data_len,
+                         unsigned char *out, size_t out_cap)
+{
+    unsigned int md_len = 0;
+
+    if (!out || out_cap < SHA256_DIGEST_LENGTH)
+        return -1;
+    if (EVP_Digest(data, data_len, out, &md_len, EVP_sha256(), NULL) != 1)
+        return -1;
+    return md_len == SHA256_DIGEST_LENGTH ? 0 : -1;
+}
+
+static int reduce_scalar_mod_order(const BIGNUM *order,
+                                   const unsigned char *in, size_t in_len,
+                                   unsigned char *out, size_t out_len)
+{
+    BIGNUM *src = NULL;
+    BIGNUM *reduced = NULL;
+    BN_CTX *bn_ctx = NULL;
+    int rc = -1;
+
+    if (!order || !in || !out || out_len != SPAKE2PLUS_SCALAR_LEN)
+        return -1;
+
+    src = BN_bin2bn(in, (int) in_len, NULL);
+    reduced = BN_new();
+    bn_ctx = BN_CTX_new();
+    if (!src || !reduced || !bn_ctx)
+        goto cleanup;
+
+    if (BN_mod(reduced, src, order, bn_ctx) != 1)
+        goto cleanup;
+    if (BN_bn2binpad(reduced, out, (int) out_len) != (int) out_len)
+        goto cleanup;
+
+    rc = 0;
+
+cleanup:
+    BN_clear_free(src);
+    BN_clear_free(reduced);
+    BN_CTX_free(bn_ctx);
+    return rc;
+}
+
+static int ec_point_from_hex(const EC_GROUP *group, const char *hex, EC_POINT *point, BN_CTX *bn_ctx)
+{
+    unsigned char buf[SPAKE2PLUS_POINT_LEN];
+    size_t len = 0;
+
+    if (!group || !hex || !point)
+        return -1;
+    if (hex_to_bytes(hex, buf, sizeof buf, &len) != 0 || len != SPAKE2PLUS_POINT_LEN)
+        return -1;
+    if (EC_POINT_oct2point(group, point, buf, len, bn_ctx) != 1)
+        return -1;
+    if (EC_POINT_is_at_infinity(group, point) == 1)
+        return -1;
+    if (EC_POINT_is_on_curve(group, point, bn_ctx) != 1)
+        return -1;
+    return 0;
+}
+
+static int ec_point_from_octets(const EC_GROUP *group,
+                                const unsigned char *octets, size_t octets_len,
+                                EC_POINT *point, BN_CTX *bn_ctx)
+{
+    if (!group || !octets || !point)
+        return -1;
+    if (EC_POINT_oct2point(group, point, octets, octets_len, bn_ctx) != 1)
+        return -1;
+    if (EC_POINT_is_at_infinity(group, point) == 1)
+        return -1;
+    if (EC_POINT_is_on_curve(group, point, bn_ctx) != 1)
+        return -1;
+    return 0;
+}
+
+static int ec_point_to_octets(const EC_GROUP *group, const EC_POINT *point,
+                              unsigned char *out, size_t out_cap, size_t *out_len,
+                              BN_CTX *bn_ctx)
+{
+    size_t len = 0;
+
+    if (!group || !point || !out || out_cap < SPAKE2PLUS_POINT_LEN)
+        return -1;
+    if (EC_POINT_is_at_infinity(group, point) == 1)
+        return -1;
+
+    len = EC_POINT_point2oct(group, point, POINT_CONVERSION_COMPRESSED, out, out_cap, bn_ctx);
+    if (len != SPAKE2PLUS_POINT_LEN)
+        return -1;
+    if (out_len)
+        *out_len = len;
+    return 0;
+}
+
+static int spake2plus_send_json_line(SOCKET sock, const char *json)
+{
+    size_t total = 0;
+    size_t len = 0;
+
+    if (!json)
+        return -1;
+    len = strlen(json);
+    while (total < len) {
+        int n = send(sock, json + total, (int) (len - total), 0);
+        if (n <= 0)
+            return -1;
+        total += (size_t) n;
+    }
+    return 0;
+}
+
+static int spake2plus_wait_status_ok(SOCKET sock)
+{
+    char response[512];
+    const char *p = NULL;
+
+    while (recv_json_line(sock, response, sizeof response) == 0) {
+        p = strstr(response, "\"status_code\"");
+        if (!p)
+            continue;
+        p = strchr(p, ':');
+        if (!p)
+            return -1;
+        p++;
+        while (*p && isspace((unsigned char) *p))
+            p++;
+        errno = 0;
+        long code = strtol(p, NULL, 10);
+        if (errno != 0 || code != 200)
+            return -1;
+        return 0;
+    }
+    return -1;
+}
+
+static int extract_spake2plus_fields(const char *json,
+                                     char *source_id, size_t source_cap,
+                                     char *sharep_hex, size_t sharep_cap)
+{
+    char payload[512];
+
+    if (!json || !source_id || !sharep_hex)
+        return -1;
+
+    if (extract_json_string(json, "source_id", source_id, source_cap) != 0)
+        return -1;
+
+    if (extract_json_string(json, "shareP", sharep_hex, sharep_cap) == 0)
+        return 0;
+
+    if (extract_json_string(json, "payload", payload, sizeof payload) == 0) {
+        if (extract_kv_string(payload, "shareP", sharep_hex, sharep_cap) == 0)
+            return 0;
+    }
+
+    return -1;
+}
+
+static int handle_pairing_message(SOCKET sock, const char *json, const char *qr_secret_str,
                                   char *out_shared_hex, size_t out_cap)
 {
-    char mac_hex[256];
-    char pubkey_hex[256];
-    unsigned char pubkey[64];
-    size_t pubkey_len = 0;
+    unsigned char qr_secret_bytes[64];
+    unsigned char registration_input[256];
+    unsigned char registration_salt[256];
+    unsigned char expanded[SPAKE2PLUS_REG_OUTPUT_LEN];
+    unsigned char w0[SPAKE2PLUS_SCALAR_LEN];
+    unsigned char w1[SPAKE2PLUS_SCALAR_LEN];
+    unsigned char sharep_octets[SPAKE2PLUS_POINT_LEN];
+    unsigned char sharev_octets[SPAKE2PLUS_POINT_LEN];
+    unsigned char z_octets[SPAKE2PLUS_POINT_LEN];
+    unsigned char v_octets[SPAKE2PLUS_POINT_LEN];
+    unsigned char transcript[SPAKE2PLUS_TRANSCRIPT_CAP];
+    unsigned char k_main[SHA256_DIGEST_LENGTH];
+    unsigned char confirmation_keys[SHA256_DIGEST_LENGTH * 2];
+    unsigned char k_shared[SHA256_DIGEST_LENGTH];
+    unsigned char confirm_v[SHA256_DIGEST_LENGTH];
+    unsigned char confirm_p[SHA256_DIGEST_LENGTH];
+    unsigned char confirm_p_expected[SHA256_DIGEST_LENGTH];
+    size_t qr_secret_len = 0;
+    size_t sharep_len = 0, sharev_len = 0, z_len = 0, v_len = 0;
+    size_t reg_input_used = 0, reg_salt_used = 0, transcript_used = 0;
+    size_t confirm_v_len = 0;
+    size_t confirm_p_len = 0;
+    char id_prover[128];
+    char id_prover_confirm[128];
+    char sharep_hex[256];
+    char sharev_hex[256];
+    char confirmv_hex[256];
+    char confirmp_hex[256];
+    char payload[768];
+    char request[1024];
+    char response[512];
+    char kshared_hex[128];
+    EC_GROUP *group = NULL;
+    EC_POINT *m_point = NULL;
+    EC_POINT *n_point = NULL;
+    EC_POINT *sharep_point = NULL;
+    EC_POINT *l_point = NULL;
+    EC_POINT *sharev_point = NULL;
+    EC_POINT *w0m_point = NULL;
+    EC_POINT *tmp_point = NULL;
+    EC_POINT *z_point = NULL;
+    EC_POINT *v_point = NULL;
+    BIGNUM *order = NULL;
+    BIGNUM *w0_bn = NULL;
+    BIGNUM *w1_bn = NULL;
+    BIGNUM *y_bn = NULL;
+    BN_CTX *bn_ctx = NULL;
+    int rc = -1;
 
-    if (extract_pairing_fields(json, mac_hex, sizeof mac_hex,
-                               pubkey_hex, sizeof pubkey_hex) != 0) {
-        fprintf(stderr, "Pairing message missing mac/pubKeyApp\n");
+    if (sock == INVALID_SOCKET || !json || !qr_secret_str)
         return -1;
+    if (out_shared_hex && out_cap > 0)
+        out_shared_hex[0] = '\0';
+
+    if (extract_spake2plus_fields(json, id_prover, sizeof id_prover,
+                                  sharep_hex, sizeof sharep_hex) != 0) {
+        fprintf(stderr, "Pairing message missing source_id/shareP\n");
+        goto cleanup;
     }
 
-    if (hex_to_bytes(pubkey_hex, pubkey, sizeof pubkey, &pubkey_len) != 0) {
-        fprintf(stderr, "pubKeyApp is not valid hex\n");
-        return -1;
+    if (hex_to_bytes(qr_secret_str, qr_secret_bytes, sizeof qr_secret_bytes, &qr_secret_len) != 0 ||
+        qr_secret_len == 0) {
+        fprintf(stderr, "qr_secret is not valid hex\n");
+        goto cleanup;
     }
 
-    if (verify_mac_hex(mac_hex, qr_secret_str, pubkey, pubkey_len, pubkey_hex) != 0)
-        return -1;
+    if (hex_to_bytes(sharep_hex, sharep_octets, sizeof sharep_octets, &sharep_len) != 0 ||
+        sharep_len != SPAKE2PLUS_POINT_LEN) {
+        fprintf(stderr, "shareP is not valid compressed P-256 hex\n");
+        goto cleanup;
+    }
 
-    if (derive_shared_secret_hex(pubkey, pubkey_len, out_shared_hex, out_cap) != 0)
-        return -1;
+    group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
+    bn_ctx = BN_CTX_new();
+    order = BN_new();
+    m_point = EC_POINT_new(group);
+    n_point = EC_POINT_new(group);
+    sharep_point = EC_POINT_new(group);
+    l_point = EC_POINT_new(group);
+    sharev_point = EC_POINT_new(group);
+    w0m_point = EC_POINT_new(group);
+    tmp_point = EC_POINT_new(group);
+    z_point = EC_POINT_new(group);
+    v_point = EC_POINT_new(group);
+    w0_bn = BN_new();
+    w1_bn = BN_new();
+    y_bn = BN_new();
+    if (!group || !bn_ctx || !order || !m_point || !n_point || !sharep_point ||
+        !l_point || !sharev_point || !w0m_point || !tmp_point || !z_point ||
+        !v_point || !w0_bn || !w1_bn || !y_bn) {
+        fprintf(stderr, "Failed to initialize SPAKE2+ verifier state\n");
+        goto cleanup;
+    }
 
-    if (persist_shared_secret(out_shared_hex) != 0)
-        return -1;
+    if (EC_GROUP_get_order(group, order, bn_ctx) != 1)
+        goto cleanup;
+    if (ec_point_from_hex(group, SPAKE2PLUS_P256_M_HEX, m_point, bn_ctx) != 0)
+        goto cleanup;
+    if (ec_point_from_hex(group, SPAKE2PLUS_P256_N_HEX, n_point, bn_ctx) != 0)
+        goto cleanup;
+    if (ec_point_from_octets(group, sharep_octets, sharep_len, sharep_point, bn_ctx) != 0) {
+        fprintf(stderr, "shareP failed group membership checks\n");
+        goto cleanup;
+    }
 
-    return 0;
+    if (append_len_prefixed(registration_input, sizeof registration_input, &reg_input_used,
+                            qr_secret_bytes, qr_secret_len) != 0 ||
+        append_len_prefixed(registration_input, sizeof registration_input, &reg_input_used,
+                            (const unsigned char *) id_prover, strlen(id_prover)) != 0 ||
+        append_len_prefixed(registration_input, sizeof registration_input, &reg_input_used,
+                            (const unsigned char *) pairing_id, strlen(pairing_id)) != 0) {
+        fprintf(stderr, "SPAKE2+ registration input overflow\n");
+        goto cleanup;
+    }
+
+    if (append_len_prefixed(registration_salt, sizeof registration_salt, &reg_salt_used,
+                            (const unsigned char *) SPAKE2PLUS_CONTEXT, strlen(SPAKE2PLUS_CONTEXT)) != 0 ||
+        append_len_prefixed(registration_salt, sizeof registration_salt, &reg_salt_used,
+                            (const unsigned char *) SPAKE2PLUS_CIPHERSUITE, strlen(SPAKE2PLUS_CIPHERSUITE)) != 0) {
+        fprintf(stderr, "SPAKE2+ registration salt overflow\n");
+        goto cleanup;
+    }
+
+    if (hkdf_sha256(registration_salt, reg_salt_used,
+                    registration_input, reg_input_used,
+                    (const unsigned char *) SPAKE2PLUS_REGISTRATION_INFO,
+                    strlen(SPAKE2PLUS_REGISTRATION_INFO),
+                    expanded, sizeof expanded) != 0) {
+        fprintf(stderr, "Failed to derive SPAKE2+ registration material\n");
+        goto cleanup;
+    }
+
+    if (reduce_scalar_mod_order(order, expanded, SPAKE2PLUS_REG_HALF_LEN, w0, sizeof w0) != 0 ||
+        reduce_scalar_mod_order(order, expanded + SPAKE2PLUS_REG_HALF_LEN, SPAKE2PLUS_REG_HALF_LEN, w1, sizeof w1) != 0) {
+        fprintf(stderr, "Failed to reduce SPAKE2+ verifier scalars\n");
+        goto cleanup;
+    }
+
+    if (BN_bin2bn(w0, (int) sizeof w0, w0_bn) == NULL ||
+        BN_bin2bn(w1, (int) sizeof w1, w1_bn) == NULL) {
+        goto cleanup;
+    }
+
+    if (EC_POINT_mul(group, l_point, w1_bn, NULL, NULL, bn_ctx) != 1)
+        goto cleanup;
+
+    do {
+        if (BN_rand_range(y_bn, order) != 1)
+            goto cleanup;
+    } while (BN_is_zero(y_bn));
+
+    if (EC_POINT_mul(group, sharev_point, y_bn, n_point, w0_bn, bn_ctx) != 1)
+        goto cleanup;
+    if (EC_POINT_mul(group, w0m_point, NULL, m_point, w0_bn, bn_ctx) != 1)
+        goto cleanup;
+    if (EC_POINT_copy(tmp_point, sharep_point) != 1)
+        goto cleanup;
+    if (EC_POINT_invert(group, w0m_point, bn_ctx) != 1)
+        goto cleanup;
+    if (EC_POINT_add(group, tmp_point, tmp_point, w0m_point, bn_ctx) != 1)
+        goto cleanup;
+    if (EC_POINT_mul(group, z_point, NULL, tmp_point, y_bn, bn_ctx) != 1)
+        goto cleanup;
+    if (EC_POINT_mul(group, v_point, NULL, l_point, y_bn, bn_ctx) != 1)
+        goto cleanup;
+
+    if (ec_point_to_octets(group, sharev_point, sharev_octets, sizeof sharev_octets, &sharev_len, bn_ctx) != 0 ||
+        ec_point_to_octets(group, z_point, z_octets, sizeof z_octets, &z_len, bn_ctx) != 0 ||
+        ec_point_to_octets(group, v_point, v_octets, sizeof v_octets, &v_len, bn_ctx) != 0) {
+        fprintf(stderr, "Failed to encode SPAKE2+ verifier points\n");
+        goto cleanup;
+    }
+
+    if (append_len_prefixed(transcript, sizeof transcript, &transcript_used,
+                            (const unsigned char *) SPAKE2PLUS_CONTEXT, strlen(SPAKE2PLUS_CONTEXT)) != 0 ||
+        append_len_prefixed(transcript, sizeof transcript, &transcript_used,
+                            (const unsigned char *) id_prover, strlen(id_prover)) != 0 ||
+        append_len_prefixed(transcript, sizeof transcript, &transcript_used,
+                            (const unsigned char *) pairing_id, strlen(pairing_id)) != 0 ||
+        append_len_prefixed(transcript, sizeof transcript, &transcript_used,
+                            (const unsigned char *) "\x02\x88\x6e\x2f\x97\xac\xe4\x6e\x55\xba\x9d\xd7\x24\x25\x79\xf2\x99\x3b\x64\xe1\x6e\xf3\xdc\xab\x95\xaf\xd4\x97\x33\x3d\x8f\xa1\x2f",
+                            SPAKE2PLUS_POINT_LEN) != 0 ||
+        append_len_prefixed(transcript, sizeof transcript, &transcript_used,
+                            (const unsigned char *) "\x03\xd8\xbb\xd6\xc6\x39\xc6\x29\x37\xb0\x4d\x99\x7f\x38\xc3\x77\x07\x19\xc6\x29\xd7\x01\x4d\x49\xa2\x4b\x4f\x98\xba\xa1\x29\x2b\x49",
+                            SPAKE2PLUS_POINT_LEN) != 0 ||
+        append_len_prefixed(transcript, sizeof transcript, &transcript_used, sharep_octets, sharep_len) != 0 ||
+        append_len_prefixed(transcript, sizeof transcript, &transcript_used, sharev_octets, sharev_len) != 0 ||
+        append_len_prefixed(transcript, sizeof transcript, &transcript_used, z_octets, z_len) != 0 ||
+        append_len_prefixed(transcript, sizeof transcript, &transcript_used, v_octets, v_len) != 0 ||
+        append_len_prefixed(transcript, sizeof transcript, &transcript_used, w0, sizeof w0) != 0) {
+        fprintf(stderr, "SPAKE2+ transcript overflow\n");
+        goto cleanup;
+    }
+
+    if (digest_sha256(transcript, transcript_used, k_main, sizeof k_main) != 0)
+        goto cleanup;
+    if (hkdf_sha256(NULL, 0, k_main, sizeof k_main,
+                    (const unsigned char *) SPAKE2PLUS_CONFIRMATION_INFO,
+                    strlen(SPAKE2PLUS_CONFIRMATION_INFO),
+                    confirmation_keys, sizeof confirmation_keys) != 0)
+        goto cleanup;
+    if (hkdf_sha256(NULL, 0, k_main, sizeof k_main,
+                    (const unsigned char *) SPAKE2PLUS_SHARED_KEY_INFO,
+                    strlen(SPAKE2PLUS_SHARED_KEY_INFO),
+                    k_shared, sizeof k_shared) != 0)
+        goto cleanup;
+    if (hmac_sha256_bytes(confirmation_keys + SHA256_DIGEST_LENGTH, SHA256_DIGEST_LENGTH,
+                          sharep_octets, sharep_len,
+                          confirm_v, sizeof confirm_v, &confirm_v_len) != 0 ||
+        confirm_v_len != SHA256_DIGEST_LENGTH) {
+        goto cleanup;
+    }
+
+    if (bytes_to_hex(sharev_octets, sharev_len, sharev_hex, sizeof sharev_hex) != 0 ||
+        bytes_to_hex(confirm_v, confirm_v_len, confirmv_hex, sizeof confirmv_hex) != 0) {
+        goto cleanup;
+    }
+
+    if (snprintf(payload, sizeof payload, "shareV=%s&confirmV=%s", sharev_hex, confirmv_hex) < 0)
+        goto cleanup;
+    if (snprintf(request, sizeof request,
+                 "{\"message_type\":\"communication\",\"source_id\":\"%s\",\"payload\":\"%s\"}\n",
+                 device_id, payload) < 0)
+        goto cleanup;
+
+    if (spake2plus_send_json_line(sock, request) != 0) {
+        fprintf(stderr, "Failed to send SPAKE2+ verifier response\n");
+        goto cleanup;
+    }
+    if (spake2plus_wait_status_ok(sock) != 0) {
+        fprintf(stderr, "Middlepoint rejected SPAKE2+ verifier response\n");
+        goto cleanup;
+    }
+
+    /* Round 2: wait for confirmP from the Prover, verify, then persist K_shared. */
+    confirmp_hex[0] = '\0';
+    id_prover_confirm[0] = '\0';
+    payload[0] = '\0';
+
+    while (recv_json_line(sock, response, sizeof response) == 0) {
+        /* Ignore status responses (shouldn't happen as we're the destination). */
+        if (strstr(response, "\"status_code\"") != NULL) {
+            continue;
+        }
+
+        if (extract_json_string(response, "source_id", id_prover_confirm, sizeof id_prover_confirm) != 0)
+            continue;
+        if (id_prover_confirm[0] == '\0' || strcmp(id_prover_confirm, id_prover) != 0)
+            continue;
+
+        if (extract_json_string(response, "confirmP", confirmp_hex, sizeof confirmp_hex) == 0)
+            break;
+
+        if (extract_json_string(response, "payload", payload, sizeof payload) == 0) {
+            if (extract_kv_string(payload, "confirmP", confirmp_hex, sizeof confirmp_hex) == 0)
+                break;
+        }
+    }
+
+    if (confirmp_hex[0] == '\0') {
+        fprintf(stderr, "Did not receive SPAKE2+ confirmP\n");
+        goto cleanup;
+    }
+
+    if (hex_to_bytes(confirmp_hex, confirm_p, sizeof confirm_p, &confirm_p_len) != 0 ||
+        confirm_p_len != SHA256_DIGEST_LENGTH) {
+        fprintf(stderr, "confirmP is not valid hex\n");
+        goto cleanup;
+    }
+
+    if (hmac_sha256_bytes(confirmation_keys, SHA256_DIGEST_LENGTH,
+                          sharev_octets, sharev_len,
+                          confirm_p_expected, sizeof confirm_p_expected, NULL) != 0) {
+        goto cleanup;
+    }
+
+    if (CRYPTO_memcmp(confirm_p, confirm_p_expected, SHA256_DIGEST_LENGTH) != 0) {
+        fprintf(stderr, "SPAKE2+ confirmP verification failed\n");
+        goto cleanup;
+    }
+
+    if (bytes_to_hex(k_shared, sizeof k_shared, kshared_hex, sizeof kshared_hex) != 0)
+        goto cleanup;
+
+    if (persist_shared_secret(kshared_hex) != 0) {
+        fprintf(stderr, "Failed to persist shared secret\n");
+        goto cleanup;
+    }
+
+    if (out_shared_hex && out_cap > 0) {
+        if (snprintf(out_shared_hex, out_cap, "%s", kshared_hex) < 0)
+            goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    OPENSSL_cleanse(qr_secret_bytes, sizeof qr_secret_bytes);
+    OPENSSL_cleanse(registration_input, sizeof registration_input);
+    OPENSSL_cleanse(registration_salt, sizeof registration_salt);
+    OPENSSL_cleanse(expanded, sizeof expanded);
+    OPENSSL_cleanse(w0, sizeof w0);
+    OPENSSL_cleanse(w1, sizeof w1);
+    OPENSSL_cleanse(sharep_octets, sizeof sharep_octets);
+    OPENSSL_cleanse(sharev_octets, sizeof sharev_octets);
+    OPENSSL_cleanse(z_octets, sizeof z_octets);
+    OPENSSL_cleanse(v_octets, sizeof v_octets);
+    OPENSSL_cleanse(transcript, sizeof transcript);
+    OPENSSL_cleanse(k_main, sizeof k_main);
+    OPENSSL_cleanse(confirmation_keys, sizeof confirmation_keys);
+    OPENSSL_cleanse(k_shared, sizeof k_shared);
+    OPENSSL_cleanse(confirm_v, sizeof confirm_v);
+    OPENSSL_cleanse(confirm_p, sizeof confirm_p);
+    OPENSSL_cleanse(confirm_p_expected, sizeof confirm_p_expected);
+    BN_clear_free(order);
+    BN_clear_free(w0_bn);
+    BN_clear_free(w1_bn);
+    BN_clear_free(y_bn);
+    EC_POINT_free(m_point);
+    EC_POINT_free(n_point);
+    EC_POINT_free(sharep_point);
+    EC_POINT_free(l_point);
+    EC_POINT_free(sharev_point);
+    EC_POINT_free(w0m_point);
+    EC_POINT_free(tmp_point);
+    EC_POINT_free(z_point);
+    EC_POINT_free(v_point);
+    EC_GROUP_free(group);
+    BN_CTX_free(bn_ctx);
+    return rc;
 }
 
 static int ensure_keypair(char *pub_hex, size_t cap)
@@ -1029,9 +1630,9 @@ int main ( int argc , char *argv[] )
         char msg[512];
         printf("Waiting for pairing message...\n");
         if (recv_json_line(handshake_sock, msg, sizeof msg) == 0) {
-            if (handle_pairing_message(msg, qr_secret,
+            if (handle_pairing_message(handshake_sock, msg, qr_secret,
                                        shared_secret_hex, sizeof shared_secret_hex) == 0) {
-                printf("Shared Secret saved.\n");
+                printf("SPAKE2+ pairing confirmed; shared secret persisted.\n");
             }
         }
 #ifdef _WIN32

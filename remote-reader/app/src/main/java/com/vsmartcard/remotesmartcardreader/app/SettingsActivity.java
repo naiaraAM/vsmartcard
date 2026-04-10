@@ -271,15 +271,34 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
     private void handleScannedURI(Uri uri) {
         try {
             String pairing_id, pub_key_pc, qr_secret;
+            byte[] qrSecretBytes;
+            Spake2Plus.ProverConfig spake2PlusConfig;
+            Spake2Plus.ProverRegistration spake2PlusRegistration;
+            Spake2Plus.ProverSession spake2PlusSession;
 
             // get fields by name
             pairing_id = getParam(uri, "pairing_id");
             pub_key_pc = getParam(uri, "pubkey");
             qr_secret = getParam(uri, "qr_secret");
+            qrSecretBytes = CryptoUtils.hexToBytes(Objects.requireNonNull(qr_secret, "Missing qr_secret"));
+            qr_secret = CryptoUtils.bytesToHex(qrSecretBytes);
 
             CryptoUtils.ensureConscrypt();
             String deviceId = getOrCreateDeviceId(this);
+            spake2PlusConfig = Spake2Plus.buildProverConfig(deviceId, pairing_id);
+            spake2PlusRegistration = Spake2Plus.deriveProverRegistration(qrSecretBytes, spake2PlusConfig);
+            spake2PlusSession = Spake2Plus.beginProverSession(spake2PlusRegistration);
             String pubKeyApp = CryptoUtils.ensureAndStorePublicKey(this);
+
+            Log.i(getClass().getName(), "Prepared SPAKE2+ Prover profile " +
+                    spake2PlusConfig.ciphersuite +
+                    " idProver=" + spake2PlusConfig.idProver +
+                    " idVerifier=" + spake2PlusConfig.idVerifier);
+            Log.i(getClass().getName(), "Derived SPAKE2+ Prover registration w0=" +
+                    spake2PlusRegistration.w0.length + " bytes w1=" +
+                    spake2PlusRegistration.w1.length + " bytes");
+            Log.i(getClass().getName(), "Prepared local SPAKE2+ shareP=" +
+                    spake2PlusSession.shareP.length + " bytes");
 
 
             SharedPreferences SP = PreferenceManager.getDefaultSharedPreferences(this);
@@ -420,7 +439,7 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
                 port = VPCDWorker.DEFAULT_PORT;
             }
 
-            if (pairingId == null || deviceId == null || pubKeyPc == null || qrSecret == null) {
+            if (pairingId == null || deviceId == null || qrSecret == null) {
                 Log.i(PairingTask.class.getName(), "Pairing data missing, skip auto pairing");
                 return null;
             }
@@ -431,10 +450,12 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
             Socket sock = null;
             try {
                 CryptoUtils.ensureConscrypt();
-                String pubKeyAppHex = CryptoUtils.ensureAndStorePublicKey(ctx);
-                byte[] pubKeyAppRaw = hexToBytes(pubKeyAppHex);
-
-                byte[] secret = deriveSharedSecret(ctx, pubKeyPc);
+                byte[] qrSecretBytes = CryptoUtils.hexToBytes(qrSecret);
+                Spake2Plus.ProverConfig spake2PlusConfig = Spake2Plus.buildProverConfig(deviceId, pairingId);
+                Spake2Plus.ProverRegistration spake2PlusRegistration =
+                        Spake2Plus.deriveProverRegistration(qrSecretBytes, spake2PlusConfig);
+                Spake2Plus.ProverSession spake2PlusSession =
+                        Spake2Plus.beginProverSession(spake2PlusRegistration);
 
                 InetAddress address = VPCDWorker.resolveAddress(hostname);
                 Log.i(PairingTask.class.getName(), "Resolved " + hostname + " to " + address.getHostAddress());
@@ -447,12 +468,17 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
                 sendLine(out, String.format("{\"message_type\":\"handshake\",\"pairing_id\":\"%s\",\"device_id\":\"%s\",\"role\":\"app\"}", pairingId, deviceId));
                 waitStatusOk(in);
 
-                String macHex = computeMac(qrSecret, pubKeyAppRaw);
-                String payload = "mac=" + macHex + "&pubKeyApp=" + pubKeyAppHex;
+                String payload = "shareP=" + CryptoUtils.bytesToHex(spake2PlusSession.shareP);
+
                 sendLine(out, String.format("{\"message_type\":\"communication\",\"source_id\":\"%s\",\"payload\":\"%s\"}", deviceId, payload));
+
+                // String macHex = computeMac(qrSecret, pubKeyAppRaw);
+                // String payload = "mac=" + macHex + "&pubKeyApp=" + pubKeyAppHex;
+                // sendLine(out, String.format("{\"message_type\":\"communication\",\"source_id\":\"%s\",\"payload\":\"%s\"}", deviceId, payload));
                 waitStatusOk(in);
 
-                Log.i(PairingTask.class.getName(), "Auto pairing succeeded; shared secret derived (" + secret.length + " bytes)");
+                Log.i(PairingTask.class.getName(), "Auto pairing sent SPAKE2+ shareP (" +
+                        spake2PlusSession.shareP.length + " bytes)");
             } catch (Exception e) {
                 Log.e(PairingTask.class.getName(), "Auto pairing failed", e);
             } finally {

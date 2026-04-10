@@ -31,6 +31,7 @@ public class CryptoUtils {
     private static final String SEC_PREFS =         "crypto_prefs";
     private static final String PRIV_KEY =          "privkey_app";
     private static final String PUB_KEY =           "pubkey_app";
+    private static final String SHARED_SECRET =      "shared_secret";
 
     private CryptoUtils() {}
 
@@ -46,6 +47,34 @@ public class CryptoUtils {
             sb.append(String.format("%02x", b));
         }
         return sb.toString();
+    }
+
+    /**
+     * Convert a hexadecimal string to a byte array.
+     * @param hex the hexadecimal string to convert
+     * @return the decoded byte array
+     * @throws IllegalArgumentException if the input is null, has odd length, or contains non-hex characters
+     */
+    public static byte[] hexToBytes(String hex) {
+        if (hex == null) {
+            throw new IllegalArgumentException("hex is null");
+        }
+
+        int len = hex.length();
+        if ((len % 2) != 0) {
+            throw new IllegalArgumentException("hex length must be even");
+        }
+
+        byte[] out = new byte[len / 2];
+        for (int i = 0; i < len; i += 2) {
+            int hi = Character.digit(hex.charAt(i), 16);
+            int lo = Character.digit(hex.charAt(i + 1), 16);
+            if (hi < 0 || lo < 0) {
+                throw new IllegalArgumentException("hex contains non-hex characters");
+            }
+            out[i / 2] = (byte) ((hi << 4) | lo);
+        }
+        return out;
     }
 
     /**
@@ -203,6 +232,39 @@ public class CryptoUtils {
 
         SharedPreferences sp = securePrefs(ctx);
         sp.edit().putString(PRIV_KEY, b64).apply();
+    }
+
+    /**
+     * Store the established shared secret (K_shared) securely.
+     * This is used as the AES-256 key material for the encrypted channel.
+     */
+    public static void storeSharedSecret(Context ctx, byte[] sharedSecret) throws Exception {
+        if (sharedSecret == null || sharedSecret.length == 0) {
+            throw new IllegalArgumentException("sharedSecret is empty");
+        }
+        String b64 = Base64.encodeToString(sharedSecret, Base64.NO_WRAP);
+        SharedPreferences sp = securePrefs(ctx);
+        sp.edit().putString(SHARED_SECRET, b64).apply();
+    }
+
+    /**
+     * Load the stored shared secret (K_shared), or null if missing.
+     */
+    public static byte[] loadSharedSecret(Context ctx) throws Exception {
+        SharedPreferences sp = securePrefs(ctx);
+        String b64 = sp.getString(SHARED_SECRET, null);
+        if (b64 == null || b64.isEmpty()) {
+            return null;
+        }
+        return Base64.decode(b64, Base64.NO_WRAP);
+    }
+
+    /**
+     * Remove any stored shared secret.
+     */
+    public static void clearSharedSecret(Context ctx) throws Exception {
+        SharedPreferences sp = securePrefs(ctx);
+        sp.edit().remove(SHARED_SECRET).apply();
     }
 
     /**
