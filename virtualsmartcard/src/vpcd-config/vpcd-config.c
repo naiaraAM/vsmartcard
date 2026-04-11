@@ -25,7 +25,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <sys/stat.h>
 #include <openssl/bn.h>
 #include <openssl/crypto.h>
@@ -33,16 +32,13 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/obj_mac.h>
-#include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include "vpcd.h"
 
-static int read_file_line(const char *path, char *out, size_t cap);
 static int write_file_line(const char *path, const char *value);
 
 static int persist_pairing_id(const char *id);
-static int load_pairing_id(char *out, size_t cap);
 static int persist_device_id(const char *id);
 static int delete_key_file(const char *filename);
 static int clear_session_state(void);
@@ -61,23 +57,17 @@ static int clear_session_state(void);
 #define INVALID_SOCKET -1
 #endif
 
-#define ERROR_STRING            "Unable to guess local IP address"
 #define DEFAULT_HANDSHAKE_HOST  "middlepoint.test"
 #define DEFAULT_HANDSHAKE_PORT  "80"
 #define DEFAULT_KEY_DIR         ".config/vpcd"
-#define PRIVATE_KEY_FILE        "vpcd_x25519_private.pem"
-#define PUBLIC_KEY_FILE         "vpcd_x25519_public.hex"
 #define QR_SECRET_FILE          "vpcd_qr_secret.hex"
 #define SHARED_SECRET_FILE      "vpcd_shared_secret.hex"
 #define PAIRING_ID_FILE         "vpcd_pairing_id.hex"
 #define DEVICE_ID_FILE          "vpcd_device_id.hex"
-#define ENV_FILE                "vpcd_env.sh"
 
 static char device_id[64];
 static char pairing_id[64];
-static char public_key_hex[128];
 static char qr_secret[64];
-static char shared_secret_hex[128];
 
 #define SPAKE2PLUS_CONTEXT               "vsmartcard-spake2plus-v1"
 #define SPAKE2PLUS_CIPHERSUITE           "P-256-SHA256-HKDF-HMAC-SHA256"
@@ -272,27 +262,6 @@ next:
     return -1;
 }
 
-static int extract_pairing_fields(const char *json,
-                                  char *mac_hex, size_t mac_cap,
-                                  char *pubkey_hex, size_t pubkey_cap)
-{
-    char payload[512];
-
-    if (extract_json_string(json, "mac", mac_hex, mac_cap) == 0 &&
-        extract_json_string(json, "pubKeyApp", pubkey_hex, pubkey_cap) == 0) {
-        return 0;
-    }
-
-    if (extract_json_string(json, "payload", payload, sizeof payload) == 0) {
-        if (extract_kv_string(payload, "mac", mac_hex, mac_cap) == 0 &&
-            extract_kv_string(payload, "pubKeyApp", pubkey_hex, pubkey_cap) == 0) {
-            return 0;
-        }
-    }
-
-    return -1;
-}
-
 static int random_u64(uint64_t *out)
 {
     if (!out)
@@ -363,164 +332,6 @@ static int persist_shared_secret(const char *hex)
     chmod(secret_path, 0600);
 #endif
     return 0;
-}
-
-static int load_private_key(EVP_PKEY **out)
-{
-    char dir_buf[512];
-    char priv_path[600];
-    const char *dir = key_dir_path(dir_buf, sizeof dir_buf);
-    FILE *f = NULL;
-    EVP_PKEY *pkey = NULL;
-
-    if (!out)
-        return -1;
-    *out = NULL;
-
-    if (snprintf(priv_path, sizeof priv_path, "%s/%s", dir, PRIVATE_KEY_FILE) < 0)
-        return -1;
-
-    f = fopen(priv_path, "r");
-    if (!f) {
-        fprintf(stderr, "Failed to open private key: %s\n", priv_path);
-        return -1;
-    }
-    pkey = PEM_read_PrivateKey(f, NULL, NULL, NULL);
-    fclose(f);
-    if (!pkey) {
-        fprintf(stderr, "Failed to read private key: %s\n", priv_path);
-        return -1;
-    }
-    *out = pkey;
-    return 0;
-}
-
-static int derive_shared_secret_hex(const unsigned char *peer_pub, size_t peer_pub_len,
-                                    char *out_hex, size_t out_cap)
-{
-    EVP_PKEY *priv = NULL;
-    EVP_PKEY *peer = NULL;
-    EVP_PKEY_CTX *ctx = NULL;
-    unsigned char secret[64];
-    size_t secret_len = 0;
-    int rc = -1;
-
-    if (!peer_pub || !out_hex)
-        return -1;
-    if (peer_pub_len != 32) {
-        fprintf(stderr, "pubKeyApp length invalid (expected 32 bytes)\n");
-        return -1;
-    }
-
-    if (load_private_key(&priv) != 0)
-        return -1;
-
-    peer = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, peer_pub, peer_pub_len);
-    if (!peer) {
-        fprintf(stderr, "Failed to load pubKeyApp\n");
-        goto cleanup;
-    }
-
-    ctx = EVP_PKEY_CTX_new(priv, NULL);
-    if (!ctx || EVP_PKEY_derive_init(ctx) <= 0 || EVP_PKEY_derive_set_peer(ctx, peer) <= 0) {
-        fprintf(stderr, "Failed to init key derivation\n");
-        goto cleanup;
-    }
-
-    if (EVP_PKEY_derive(ctx, NULL, &secret_len) <= 0 || secret_len > sizeof secret) {
-        fprintf(stderr, "Failed to size shared secret\n");
-        goto cleanup;
-    }
-
-    if (EVP_PKEY_derive(ctx, secret, &secret_len) <= 0) {
-        fprintf(stderr, "Failed to derive shared secret\n");
-        goto cleanup;
-    }
-
-    if (bytes_to_hex(secret, secret_len, out_hex, out_cap) != 0) {
-        fprintf(stderr, "Shared secret buffer too small\n");
-        goto cleanup;
-    }
-
-    rc = 0;
-
-cleanup:
-    if (ctx)
-        EVP_PKEY_CTX_free(ctx);
-    if (peer)
-        EVP_PKEY_free(peer);
-    if (priv)
-        EVP_PKEY_free(priv);
-    OPENSSL_cleanse(secret, sizeof secret);
-    return rc;
-}
-
-static int mac_matches(const unsigned char *mac, size_t mac_len,
-                       const unsigned char *key, size_t key_len,
-                       const unsigned char *data, size_t data_len)
-{
-    unsigned char hmac[EVP_MAX_MD_SIZE];
-    unsigned int hmac_len = 0;
-
-    if (!mac || !key || !data)
-        return -1;
-
-    if (!HMAC(EVP_sha256(), key, (int) key_len, data, data_len, hmac, &hmac_len)) {
-        fprintf(stderr, "Failed to compute HMAC\n");
-        return -1;
-    }
-
-    if (mac_len != (size_t) hmac_len || CRYPTO_memcmp(mac, hmac, hmac_len) != 0)
-        return -1;
-
-    return 0;
-}
-
-static int verify_mac_hex(const char *mac_hex,
-                          const char *qr_secret_str,
-                          const unsigned char *pubkey,
-                          size_t pubkey_len,
-                          const char *pubkey_hex)
-{
-    unsigned char mac_bytes[EVP_MAX_MD_SIZE];
-    size_t mac_len = 0;
-    unsigned char key_bytes[64];
-    size_t key_len = 0;
-    const unsigned char *key_raw = (const unsigned char *) qr_secret_str;
-    size_t key_raw_len = qr_secret_str ? strlen(qr_secret_str) : 0;
-    int key_is_hex = 0;
-
-    if (!mac_hex || !qr_secret_str || !pubkey || !pubkey_hex)
-        return -1;
-
-    if (hex_to_bytes(mac_hex, mac_bytes, sizeof mac_bytes, &mac_len) != 0) {
-        fprintf(stderr, "MAC is not valid hex\n");
-        return -1;
-    }
-
-    if (hex_to_bytes(qr_secret_str, key_bytes, sizeof key_bytes, &key_len) == 0 && key_len > 0)
-        key_is_hex = 1;
-
-    /* Try MAC with hex-decoded key (preferred) and raw key as fallback.
-     * Try data as raw pubkey bytes first, then hex string if needed. */
-    if (key_is_hex) {
-        if (mac_matches(mac_bytes, mac_len, key_bytes, key_len, pubkey, pubkey_len) == 0)
-            return 0;
-        if (mac_matches(mac_bytes, mac_len, key_bytes, key_len,
-                        (const unsigned char *) pubkey_hex, strlen(pubkey_hex)) == 0)
-            return 0;
-    }
-
-    if (key_raw_len > 0) {
-        if (mac_matches(mac_bytes, mac_len, key_raw, key_raw_len, pubkey, pubkey_len) == 0)
-            return 0;
-        if (mac_matches(mac_bytes, mac_len, key_raw, key_raw_len,
-                        (const unsigned char *) pubkey_hex, strlen(pubkey_hex)) == 0)
-            return 0;
-    }
-
-    fprintf(stderr, "MAC verification failed\n");
-    return -1;
 }
 
 static int recv_json_line(SOCKET sock, char *out, size_t cap)
@@ -1160,87 +971,6 @@ cleanup:
     return rc;
 }
 
-static int ensure_keypair(char *pub_hex, size_t cap)
-{
-    char dir_buf[512];
-    char priv_path[600];
-    char pub_path[600];
-    const char *dir = key_dir_path(dir_buf, sizeof dir_buf);
-    EVP_PKEY *pkey = NULL;
-    FILE *f = NULL;
-
-#ifndef _WIN32
-    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
-        fprintf(stderr, "Failed to create key dir: %s\n", dir);
-        return -1;
-    }
-#endif
-
-    if (snprintf(priv_path, sizeof priv_path, "%s/%s", dir, PRIVATE_KEY_FILE) < 0)
-        return -1;
-    if (snprintf(pub_path, sizeof pub_path, "%s/%s", dir, PUBLIC_KEY_FILE) < 0)
-        return -1;
-
-    f = fopen(priv_path, "r");
-    if (f) {
-        pkey = PEM_read_PrivateKey(f, NULL, NULL, NULL);
-        fclose(f);
-    }
-
-    if (!pkey) {
-        pkey = EVP_PKEY_Q_keygen(NULL, NULL, "X25519");
-        if (!pkey) {
-            fprintf(stderr, "Failed to generate X25519 keypair\n");
-            return -1;
-        }
-        f = fopen(priv_path, "w");
-        if (!f) {
-            fprintf(stderr, "Failed to write private key: %s\n", priv_path);
-            EVP_PKEY_free(pkey);
-            return -1;
-        }
-        if (PEM_write_PrivateKey(f, pkey, NULL, NULL, 0, NULL, NULL) != 1) {
-            fclose(f);
-            EVP_PKEY_free(pkey);
-            fprintf(stderr, "Failed to persist private key\n");
-            return -1;
-        }
-        fclose(f);
-#ifndef _WIN32
-        chmod(priv_path, 0600);
-#endif
-    }
-
-    unsigned char pub[64];
-    size_t pub_len = sizeof pub;
-    if (EVP_PKEY_get_raw_public_key(pkey, pub, &pub_len) != 1) {
-        EVP_PKEY_free(pkey);
-        fprintf(stderr, "Failed to get public key\n");
-        return -1;
-    }
-    if (cap < (pub_len * 2 + 1)) {
-        EVP_PKEY_free(pkey);
-        fprintf(stderr, "Public key buffer too small\n");
-        return -1;
-    }
-    for (size_t i = 0; i < pub_len; i++) {
-        snprintf(pub_hex + (i * 2), cap - (i * 2), "%02x", pub[i]);
-    }
-    pub_hex[pub_len * 2] = '\0';
-
-    f = fopen(pub_path, "w");
-    if (f) {
-        fprintf(f, "%s\n", pub_hex);
-        fclose(f);
-#ifndef _WIN32
-        chmod(pub_path, 0644);
-#endif
-    }
-
-    EVP_PKEY_free(pkey);
-    return 0;
-}
-
 static int ensure_qr_secret(char *out, size_t cap)
 {
     char dir_buf[512];
@@ -1393,11 +1123,6 @@ static int do_handshake(SOCKET *out_sock)
     }
     persist_device_id(device_id);
 
-    if (ensure_keypair(public_key_hex, sizeof public_key_hex) != 0) {
-        fprintf(stderr, "Failed to create or load keypair.\n");
-        return -1;
-    }
-
     if (snprintf(request, sizeof request,
                 "{\"message_type\":\"handshake\",\"pairing_id\":\"%s\",\"device_id\":\"%s\",\"role\":\"%s\"}\n",
                 pairing_id, device_id, role) < 0) {
@@ -1504,19 +1229,6 @@ cleanup:
     return rc;
 }
 
-static int read_file_line(const char *path, char *out, size_t cap)
-{
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-    if (!fgets(out, (int) cap, f)) {
-        fclose(f);
-        return -1;
-    }
-    fclose(f);
-    trim_newline(out);
-    return out[0] ? 0 : -1;
-}
-
 static int write_file_line(const char *path, const char *value)
 {
     FILE *f = fopen(path, "w");
@@ -1537,16 +1249,6 @@ static int persist_pairing_id(const char *id)
     if (snprintf(path, sizeof path, "%s/%s", dir, PAIRING_ID_FILE) < 0)
         return -1;
     return write_file_line(path, id);
-}
-
-static int load_pairing_id(char *out, size_t cap)
-{
-    char dir_buf[512];
-    char path[600];
-    const char *dir = key_dir_path(dir_buf, sizeof dir_buf);
-    if (snprintf(path, sizeof path, "%s/%s", dir, PAIRING_ID_FILE) < 0)
-        return -1;
-    return read_file_line(path, out, cap);
 }
 
 static int persist_device_id(const char *id)
@@ -1592,6 +1294,9 @@ int main ( int argc , char *argv[] )
     int fail = 0;
     SOCKET handshake_sock = INVALID_SOCKET;
 
+    (void) argc;
+    (void) argv;
+
     if (do_handshake(&handshake_sock) != 0) {
         fail = 1;
         goto err;
@@ -1607,12 +1312,11 @@ int main ( int argc , char *argv[] )
 
     for (slot = 0; slot < VICC_MAX_SLOTS; slot++) {
         printf("Pairing ID:     %s\n", pairing_id);
-        printf("Public Key:     %s\n", public_key_hex);
         printf("QR Secret:      %s\n", qr_secret);
         printf("On your NFC phone with the Remote Smart Card Reader app scan this code:\n");
         int n = snprintf(uri, sizeof uri,
-                         "vpcd://pairing_id=%s&pubkey=%s&qr_secret=%s",
-                         pairing_id, public_key_hex, qr_secret);
+                         "vpcd://pairing_id=%s&qr_secret=%s",
+                         pairing_id, qr_secret);
         if (n < 0) {
             fprintf(stderr, "Failed to build QR URI\n");
             continue;
@@ -1630,8 +1334,7 @@ int main ( int argc , char *argv[] )
         char msg[512];
         printf("Waiting for pairing message...\n");
         if (recv_json_line(handshake_sock, msg, sizeof msg) == 0) {
-            if (handle_pairing_message(handshake_sock, msg, qr_secret,
-                                       shared_secret_hex, sizeof shared_secret_hex) == 0) {
+            if (handle_pairing_message(handshake_sock, msg, qr_secret, NULL, 0) == 0) {
                 printf("SPAKE2+ pairing confirmed; shared secret persisted.\n");
             }
         }
