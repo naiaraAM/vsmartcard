@@ -49,16 +49,6 @@
             android:summary="XXXXXXXXXXXXXXX" />
 
         <Preference
-            android:key="pubkey_pc"
-            android:title="Public key remote PC"
-            android:summary="XXXXXXXXXXXXXXX" />
-
-        <Preference
-            android:key="pubkey_app"
-            android:title="Public key app"
-            android:summary="XXXXXXXXXXXXXXX" />
-
-        <Preference
         android:key="qr_secret"
         android:title="QR Secret"
         android:summary="XXXXXXXXXXXXXXX" />

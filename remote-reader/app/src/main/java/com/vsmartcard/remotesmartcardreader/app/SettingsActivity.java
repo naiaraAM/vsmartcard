@@ -43,15 +43,6 @@ import com.google.zxing.integration.android.IntentResult;
 
 import com.example.android.common.logger.Log;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.InetAddress;
-import java.net.Socket;
-import java.net.URI;
-import javax.crypto.KeyAgreement;
-import java.security.PrivateKey;
-import java.security.PublicKey;
 import java.util.Objects;
 
 /**
@@ -187,11 +178,6 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
             
             CryptoUtils.ensureConscrypt();
             getOrCreateDeviceId(getActivity());
-            try {
-                CryptoUtils.ensureAndStorePublicKey(getActivity());
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
             
             bindPreferenceSummaryToValue(findPreference("delay"));
             bindPreferenceSummaryToValue(findPreference("timeout"));
@@ -199,8 +185,6 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
             // add new fields
             bindPreferenceSummaryToValue(findPreference("pairing_id"));
             bindPreferenceSummaryToValue(findPreference("device_id"));
-            bindPreferenceSummaryToValue(findPreference("pubkey_pc"));
-            bindPreferenceSummaryToValue(findPreference("pubkey_app"));
             bindPreferenceSummaryToValue(findPreference("qr_secret"));
 
 
@@ -270,7 +254,7 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
 
     private void handleScannedURI(Uri uri) {
         try {
-            String pairing_id, pub_key_pc, qr_secret;
+            String pairing_id, qr_secret;
             byte[] qrSecretBytes;
             Spake2Plus.ProverConfig spake2PlusConfig;
             Spake2Plus.ProverRegistration spake2PlusRegistration;
@@ -278,7 +262,6 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
 
             // get fields by name
             pairing_id = getParam(uri, "pairing_id");
-            pub_key_pc = getParam(uri, "pubkey");
             qr_secret = getParam(uri, "qr_secret");
             qrSecretBytes = CryptoUtils.hexToBytes(Objects.requireNonNull(qr_secret, "Missing qr_secret"));
             qr_secret = CryptoUtils.bytesToHex(qrSecretBytes);
@@ -288,7 +271,6 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
             spake2PlusConfig = Spake2Plus.buildProverConfig(deviceId, pairing_id);
             spake2PlusRegistration = Spake2Plus.deriveProverRegistration(qrSecretBytes, spake2PlusConfig);
             spake2PlusSession = Spake2Plus.beginProverSession(spake2PlusRegistration);
-            String pubKeyApp = CryptoUtils.ensureAndStorePublicKey(this);
 
             Log.i(getClass().getName(), "Prepared SPAKE2+ Prover profile " +
                     spake2PlusConfig.ciphersuite +
@@ -305,8 +287,6 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
             SharedPreferences.Editor editor = SP.edit();
             editor.putString("pairing_id", pairing_id);
             editor.putString("device_id", deviceId);
-            editor.putString("pubkey_pc", pub_key_pc);
-            editor.putString("pubkey_app", pubKeyApp);
             editor.putString("qr_secret", qr_secret);
             editor.putBoolean("pairing_confirmed", false);
             editor.apply();
@@ -382,188 +362,11 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
         return tmp.getQueryParameter(key);
     }
 
-    private static String getFirstParam(Uri uri, String... keys) {
-        if (keys == null) {
-            return null;
-        }
-        for (String key : keys) {
-            String value = getParam(uri, key);
-            if (value != null && !value.isEmpty()) {
-                return value;
-            }
-        }
-        return null;
-    }
-
-    private static boolean isValidPort(String port) {
-        if (port == null || port.isEmpty()) {
-            return false;
-        }
-        try {
-            int value = Integer.parseInt(port);
-            return value > 0 && value < 65536;
-        } catch (NumberFormatException e) {
-            return false;
-        }
-    }
 
     private void showMessage(String message) {
         View content = findViewById(android.R.id.content);
         if (content != null) {
             Snackbar.make(content, message, Snackbar.LENGTH_LONG).show();
-        }
-    }
-
-    /**
-     * Tarea ligera para validar el emparejamiento nada más escanear el QR.
-     * Usa la misma lógica de handshake+pairing que VPCDWorker pero sin esperar a una tarjeta NFC.
-     */
-    private static class PairingTask extends android.os.AsyncTask<Void, Void, Void> {
-        private final Context ctx;
-        PairingTask(Context ctx) {
-            this.ctx = ctx.getApplicationContext();
-        }
-
-        @Override
-        protected Void doInBackground(Void... voids) {
-            SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(ctx);
-            String pairingId = sp.getString("pairing_id", null);
-            String deviceId  = sp.getString("device_id", null);
-            String pubKeyPc  = sp.getString("pubkey_pc", null);
-            String qrSecret  = sp.getString("qr_secret", null);
-            String hostname  = sp.getString("hostname", VPCDWorker.DEFAULT_HOSTNAME);
-            int port;
-            try {
-                port = Integer.parseInt(sp.getString("port", Integer.toString(VPCDWorker.DEFAULT_PORT)));
-            } catch (NumberFormatException e) {
-                port = VPCDWorker.DEFAULT_PORT;
-            }
-
-            if (pairingId == null || deviceId == null || qrSecret == null) {
-                Log.i(PairingTask.class.getName(), "Pairing data missing, skip auto pairing");
-                return null;
-            }
-
-            Log.i(PairingTask.class.getName(), "Trying auto pairing to " + hostname + ":" + port +
-                    " pairingId=" + pairingId + " deviceId=" + deviceId);
-
-            Socket sock = null;
-            try {
-                CryptoUtils.ensureConscrypt();
-                byte[] qrSecretBytes = CryptoUtils.hexToBytes(qrSecret);
-                Spake2Plus.ProverConfig spake2PlusConfig = Spake2Plus.buildProverConfig(deviceId, pairingId);
-                Spake2Plus.ProverRegistration spake2PlusRegistration =
-                        Spake2Plus.deriveProverRegistration(qrSecretBytes, spake2PlusConfig);
-                Spake2Plus.ProverSession spake2PlusSession =
-                        Spake2Plus.beginProverSession(spake2PlusRegistration);
-
-                InetAddress address = VPCDWorker.resolveAddress(hostname);
-                Log.i(PairingTask.class.getName(), "Resolved " + hostname + " to " + address.getHostAddress());
-                sock = new Socket(address, port);
-                sock.setTcpNoDelay(true);
-
-                OutputStream out = sock.getOutputStream();
-                InputStream in = sock.getInputStream();
-
-                sendLine(out, String.format("{\"message_type\":\"handshake\",\"pairing_id\":\"%s\",\"device_id\":\"%s\",\"role\":\"app\"}", pairingId, deviceId));
-                waitStatusOk(in);
-
-                String payload = "shareP=" + CryptoUtils.bytesToHex(spake2PlusSession.shareP);
-
-                sendLine(out, String.format("{\"message_type\":\"communication\",\"source_id\":\"%s\",\"payload\":\"%s\"}", deviceId, payload));
-
-                // String macHex = computeMac(qrSecret, pubKeyAppRaw);
-                // String payload = "mac=" + macHex + "&pubKeyApp=" + pubKeyAppHex;
-                // sendLine(out, String.format("{\"message_type\":\"communication\",\"source_id\":\"%s\",\"payload\":\"%s\"}", deviceId, payload));
-                waitStatusOk(in);
-
-                Log.i(PairingTask.class.getName(), "Auto pairing sent SPAKE2+ shareP (" +
-                        spake2PlusSession.shareP.length + " bytes)");
-            } catch (Exception e) {
-                Log.e(PairingTask.class.getName(), "Auto pairing failed", e);
-            } finally {
-                if (sock != null) {
-                    try { sock.close(); } catch (IOException ignored) {}
-                }
-            }
-            return null;
-        }
-
-        private static void sendLine(OutputStream out, String json) throws IOException {
-            out.write((json + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            out.flush();
-        }
-
-        private static void waitStatusOk(InputStream in) throws IOException {
-            String line;
-            while ((line = readLine(in)) != null) {
-                if (line.isEmpty()) continue;
-                Log.i(PairingTask.class.getName(), "Server line: " + line);
-                try {
-                    org.json.JSONObject obj = new org.json.JSONObject(line);
-                    if (obj.has("status_code")) {
-                        int code = obj.getInt("status_code");
-                        if (code != 200) {
-                            String payload = obj.optString("payload", "");
-                            throw new IOException("status " + code + (payload.isEmpty() ? "" : (" payload=" + payload)));
-                        }
-                        return;
-                    }
-                    // Si llegó algo que no tiene status_code, sigue leyendo
-                } catch (org.json.JSONException ignored) {}
-            }
-            throw new IOException("connection closed");
-        }
-
-        private static String readLine(InputStream in) throws IOException {
-            StringBuilder sb = new StringBuilder();
-            int ch;
-            while ((ch = in.read()) != -1) {
-                if (ch == '\n') break;
-                sb.append((char) ch);
-            }
-            if (sb.length() == 0 && ch == -1) return null;
-            return sb.toString().trim();
-        }
-
-        private static byte[] deriveSharedSecret(Context ctx, String peerHex) throws Exception {
-            if (peerHex == null || peerHex.isEmpty()) {
-                throw new IOException("Missing peer public key");
-            }
-            byte[] peerRaw = hexToBytes(peerHex);
-            PrivateKey priv = CryptoUtils.loadPrivateKey(ctx);
-            PublicKey peer = decodeX25519PublicKey(peerRaw);
-            KeyAgreement ka = KeyAgreement.getInstance("X25519");
-            ka.init(priv);
-            ka.doPhase(peer, true);
-            return ka.generateSecret();
-        }
-
-        private static PublicKey decodeX25519PublicKey(byte[] raw) throws Exception {
-            byte[] spki = new byte[12 + raw.length];
-            byte[] prefix = new byte[]{0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x03, 0x21, 0x00};
-            System.arraycopy(prefix, 0, spki, 0, prefix.length);
-            System.arraycopy(raw, 0, spki, prefix.length, raw.length);
-            java.security.spec.X509EncodedKeySpec spec = new java.security.spec.X509EncodedKeySpec(spki);
-            return java.security.KeyFactory.getInstance("X25519").generatePublic(spec);
-        }
-
-        private static String computeMac(String secret, byte[] data) throws Exception {
-            javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
-            mac.init(new javax.crypto.spec.SecretKeySpec(secret.getBytes(java.nio.charset.StandardCharsets.UTF_8), "HmacSHA256"));
-            return CryptoUtils.bytesToHex(mac.doFinal(data));
-        }
-
-        private static byte[] hexToBytes(String hex) {
-            if (hex == null) throw new IllegalArgumentException("hex is null");
-            int len = hex.length();
-            if ((len % 2) != 0) throw new IllegalArgumentException("hex length must be even");
-            byte[] out = new byte[len / 2];
-            for (int i = 0; i < len; i += 2) {
-                out[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4)
-                        + Character.digit(hex.charAt(i + 1), 16));
-            }
-            return out;
         }
     }
 }
