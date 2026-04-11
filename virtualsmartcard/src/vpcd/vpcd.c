@@ -23,10 +23,6 @@
 #include "config.h"
 #endif
 
-#if (!defined HAVE_DECL_MSG_NOSIGNAL) || !HAVE_DECL_MSG_NOSIGNAL
-#define MSG_NOSIGNAL 0
-#endif
-
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -39,12 +35,8 @@ typedef WORD uint16_t;
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h> /* for TCP_NODELAY */
-#include <poll.h>
 #include <stdint.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <unistd.h>
 #endif
 
@@ -54,7 +46,6 @@ typedef WORD uint16_t;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/types.h>
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -722,89 +713,7 @@ static int vicc_prepare(struct vicc_ctx *ctx)
 
 static ssize_t sendToVICC(struct vicc_ctx *ctx, size_t size, const unsigned char *buffer);
 static ssize_t recvFromVICC(struct vicc_ctx *ctx, unsigned char **buffer);
-
-static ssize_t sendall(SOCKET sock, const void *buffer, size_t size);
-static ssize_t recvall(SOCKET sock, void *buffer, size_t size);
-
-static SOCKET opensock(unsigned short port);
 static SOCKET connectsock(const char *hostname, unsigned short port);
-
-ssize_t sendall(SOCKET sock, const void *buffer, size_t size)
-{
-    size_t sent = 0;
-    ssize_t r;
-
-    /* FIXME we should actually check the length instead of simply casting from
-     * size_t to ssize_t (or int), which have both the same width! */
-    while (sent < size) {
-        r = send(sock, (void *) (((unsigned char *) buffer)+sent),
-#ifdef _WIN32
-                (int)
-#endif
-                (size-sent), MSG_NOSIGNAL);
-
-        if (r < 0)
-            return r;
-
-        sent += r;
-    }
-
-    return (ssize_t) sent;
-}
-
-ssize_t recvall(SOCKET sock, void *buffer, size_t size) {
-    return recv(sock, buffer,
-#ifdef _WIN32
-            (int)
-#endif
-            size, MSG_WAITALL|MSG_NOSIGNAL);
-}
-
-static SOCKET opensock(unsigned short port)
-{
-    SOCKET sock;
-    socklen_t yes = 1;
-    struct sockaddr_in server_sockaddr;
-
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == INVALID_SOCKET)
-        return INVALID_SOCKET;
-
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *) &yes, sizeof yes) != 0) 
-        goto err;
-
-#if HAVE_DECL_SO_NOSIGPIPE
-    if (setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, (void *) &yes, sizeof yes) != 0)
-        goto err;
-#endif
-#ifdef TCP_NODELAY
-    if(setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (void *) &yes, sizeof yes) != 0)
-        goto err;
-#endif
-
-    memset(&server_sockaddr, 0, sizeof server_sockaddr);
-    server_sockaddr.sin_family      = PF_INET;
-    server_sockaddr.sin_port        = htons(port);
-    server_sockaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-    if (bind(sock, (struct sockaddr *) &server_sockaddr,
-                sizeof server_sockaddr) != 0)  {
-        perror(NULL);
-        goto err;
-    }
-
-    if (listen(sock, 0) != 0) {
-        perror(NULL);
-        goto err;
-    }
-
-    return sock;
-
-err:
-    close(sock);
-
-    return INVALID_SOCKET;
-}
 
 static SOCKET connectsock(const char *hostname, unsigned short port)
 {
@@ -842,50 +751,6 @@ static SOCKET connectsock(const char *hostname, unsigned short port)
 err:
 	freeaddrinfo(res);
 	return sock;
-}
-
-SOCKET waitforclient(SOCKET server, long secs, long usecs)
-{
-    struct sockaddr_in client_sockaddr;
-    socklen_t client_socklen = sizeof client_sockaddr;
-
-#if _WIN32
-    fd_set rfds;
-    struct timeval tv;
-
-    FD_ZERO(&rfds);
-#pragma warning(disable:4127)
-    FD_SET(server, &rfds);
-#pragma warning(default:4127)
-
-    tv.tv_sec = secs;
-    tv.tv_usec = usecs;
-
-    if (select((int) server+1, &rfds, NULL, NULL, &tv) == -1)
-        return INVALID_SOCKET;
-
-    if (FD_ISSET(server, &rfds))
-    /* work around clumsy define of FD_SET in winsock2.h */
-
-#else
-    int timeout;
-    struct pollfd pfd;
-
-    pfd.fd = server;
-    pfd.events = POLLIN;
-    pfd.revents = 0;
-
-    timeout = (secs * 1000 + usecs / 1000);
-
-    if (poll(&pfd, 1, timeout) == -1)
-        return INVALID_SOCKET;
-
-    if(pfd.revents & POLLIN)
-#endif
-        return accept(server, (struct sockaddr *) &client_sockaddr,
-                &client_socklen);
-
-    return INVALID_SOCKET;
 }
 
 static ssize_t sendToVICC(struct vicc_ctx *ctx, size_t length, const unsigned char* buffer)
