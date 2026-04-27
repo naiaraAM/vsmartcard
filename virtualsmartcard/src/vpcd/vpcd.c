@@ -387,6 +387,8 @@ static int encrypt_frame(struct vicc_ctx *ctx,
 {
     unsigned char nonce[NONCE_LEN];
     unsigned char tag[TAG_LEN];
+    unsigned char *pt_chained = NULL;
+    size_t pt_chained_len = 0;
     unsigned char *ct = NULL;
     unsigned char *blob = NULL;
     int len = 0, ct_len = 0;
@@ -400,9 +402,17 @@ static int encrypt_frame(struct vicc_ctx *ctx,
         return -1;
     }
 
-    ct = (unsigned char *) malloc(pt_len);
-    if (!ct)
+    /* Prepend previous tag so each frame is chained to the prior one. */
+    pt_chained_len = TAG_LEN + pt_len;
+    pt_chained = (unsigned char *) malloc(pt_chained_len);
+    if (!pt_chained)
         return -1;
+    memcpy(pt_chained, ctx->chain_send, TAG_LEN);
+    memcpy(pt_chained + TAG_LEN, pt, pt_len);
+
+    ct = (unsigned char *) malloc(pt_chained_len);
+    if (!ct)
+        goto cleanup;
 
     EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
     if (!c)
@@ -415,7 +425,7 @@ static int encrypt_frame(struct vicc_ctx *ctx,
     if (EVP_EncryptInit_ex(c, NULL, NULL, ctx->shared_secret, nonce) != 1)
         goto cleanup;
 
-    if (EVP_EncryptUpdate(c, ct, &len, pt, (int) pt_len) != 1)
+    if (EVP_EncryptUpdate(c, ct, &len, pt_chained, (int) pt_chained_len) != 1)
         goto cleanup;
     ct_len = len;
 
@@ -438,17 +448,24 @@ static int encrypt_frame(struct vicc_ctx *ctx,
     if (b64_encode(blob, total, out_b64, out_cap) != 0)
         goto cleanup;
 
+    /* Update chaining state only after a frame is successfully serialized. */
+    memcpy(ctx->chain_send, tag, TAG_LEN);
+
     rc = 0;
 
 cleanup:
     if (c)
         EVP_CIPHER_CTX_free(c);
+    if (pt_chained) {
+        OPENSSL_cleanse(pt_chained, pt_chained_len);
+        free(pt_chained);
+    }
     if (ct) {
-        OPENSSL_cleanse(ct, pt_len);
+        OPENSSL_cleanse(ct, pt_chained_len);
         free(ct);
     }
     if (blob) {
-        OPENSSL_cleanse(blob, NONCE_LEN + pt_len + TAG_LEN);
+        OPENSSL_cleanse(blob, NONCE_LEN + (size_t) ct_len + TAG_LEN);
         free(blob);
     }
     return rc;
@@ -510,6 +527,18 @@ static int decrypt_frame(struct vicc_ctx *ctx,
     }
     pt_len += len;
     EVP_CIPHER_CTX_free(c);
+
+    /* Validate chaining prefix and strip it from returned plaintext. */
+    if (pt_len < TAG_LEN + 2)
+        goto cleanup;
+    if (CRYPTO_memcmp(pt, ctx->chain_recv, TAG_LEN) != 0)
+        goto cleanup;
+
+    /* Update expected chaining tag to this frame's tag. */
+    memcpy(ctx->chain_recv, tag, TAG_LEN);
+
+    pt_len -= TAG_LEN;
+    memmove(pt, pt + TAG_LEN, (size_t) pt_len);
 
     *out = pt;
     *out_len = (size_t) pt_len;
@@ -949,6 +978,10 @@ int vicc_connect(struct vicc_ctx *ctx, long secs, long usecs)
             ctx->client_sock = INVALID_SOCKET;
             return 0;
         }
+
+        /* Reset chaining state on each new TCP connection. */
+        memset(ctx->chain_send, 0, TAG_LEN);
+        memset(ctx->chain_recv, 0, TAG_LEN);
     }
 
     return 1;

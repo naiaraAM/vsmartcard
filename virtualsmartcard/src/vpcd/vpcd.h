@@ -59,6 +59,10 @@ struct vicc_ctx {
         char device_id[64];
         unsigned char shared_secret[32];
         size_t shared_secret_length;
+
+        /* Anti-replay chaining state (per direction). */
+        unsigned char chain_send[16];
+        unsigned char chain_recv[16];
 };
 
 #ifdef __cplusplus

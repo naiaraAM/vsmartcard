@@ -42,6 +42,7 @@ import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
+import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.ArrayDeque;
 import java.util.Arrays;
@@ -56,6 +57,9 @@ import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
 class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
+
+    private static final int GCM_NONCE_LEN = 12;
+    private static final int GCM_TAG_LEN = 16;
 
     public static class VPCDWorkerParams {
         final String hostname;
@@ -83,6 +87,11 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
     private OutputStream outputStream;
     private byte[] sharedSecret;
     private boolean secureMode = false;
+
+    // Per-direction chaining state to prevent replay/out-of-order frames.
+    // The plaintext is prefixed with the previous frame's GCM tag.
+    private final byte[] sendChainTag = new byte[GCM_TAG_LEN];
+    private final byte[] recvChainTag = new byte[GCM_TAG_LEN];
     private String pairingId;
     private String deviceId;
     private String qrSecret;
@@ -285,6 +294,11 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
             if (!secureMode) {
                 throw new IOException("Secure channel could not be established");
             }
+
+            // Reset chaining state on (re)connect.
+            Arrays.fill(sendChainTag, (byte) 0);
+            Arrays.fill(recvChainTag, (byte) 0);
+
             Log.i(this.getClass().getName(), "Secure channel established");
         } catch (Exception e) {
             throw new IOException("Could not initialize secure channel: " + e.getMessage(), e);
@@ -681,13 +695,24 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
     }
 
     private String encryptPayload(byte[] plain) throws Exception {
-        byte[] nonce = new byte[12];
+        byte[] chainedPlain = new byte[GCM_TAG_LEN + plain.length];
+        System.arraycopy(sendChainTag, 0, chainedPlain, 0, GCM_TAG_LEN);
+        System.arraycopy(plain, 0, chainedPlain, GCM_TAG_LEN, plain.length);
+
+        byte[] nonce = new byte[GCM_NONCE_LEN];
         new SecureRandom().nextBytes(nonce);
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         GCMParameterSpec spec = new GCMParameterSpec(128, nonce);
         SecretKeySpec keySpec = new SecretKeySpec(sharedSecret, "AES");
         cipher.init(Cipher.ENCRYPT_MODE, keySpec, spec);
-        byte[] ct = cipher.doFinal(plain);
+
+        byte[] ct = cipher.doFinal(chainedPlain);
+
+        if (ct.length < GCM_TAG_LEN) {
+            throw new IOException("Ciphertext too short");
+        }
+        System.arraycopy(ct, ct.length - GCM_TAG_LEN, sendChainTag, 0, GCM_TAG_LEN);
+
         byte[] blob = new byte[nonce.length + ct.length];
         System.arraycopy(nonce, 0, blob, 0, nonce.length);
         System.arraycopy(ct, 0, blob, nonce.length, ct.length);
@@ -696,16 +721,34 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
 
     private byte[] decryptPayload(String payload) throws Exception {
         byte[] blob = Base64.decode(payload, Base64.DEFAULT);
-        if (blob.length < 12 + 16) {
+        if (blob.length < GCM_NONCE_LEN + GCM_TAG_LEN) {
             throw new IOException("Ciphertext too short");
         }
-        byte[] nonce = Arrays.copyOfRange(blob, 0, 12);
-        byte[] ct = Arrays.copyOfRange(blob, 12, blob.length);
+        byte[] nonce = Arrays.copyOfRange(blob, 0, GCM_NONCE_LEN);
+        byte[] ct = Arrays.copyOfRange(blob, GCM_NONCE_LEN, blob.length);
+
+        if (ct.length < GCM_TAG_LEN) {
+            throw new IOException("Ciphertext too short");
+        }
+        byte[] receivedTag = Arrays.copyOfRange(ct, ct.length - GCM_TAG_LEN, ct.length);
+
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         GCMParameterSpec spec = new GCMParameterSpec(128, nonce);
         SecretKeySpec keySpec = new SecretKeySpec(sharedSecret, "AES");
         cipher.init(Cipher.DECRYPT_MODE, keySpec, spec);
-        return cipher.doFinal(ct);
+
+        byte[] chainedPlain = cipher.doFinal(ct);
+        if (chainedPlain.length < GCM_TAG_LEN + 2) {
+            throw new IOException("Invalid decrypted frame");
+        }
+
+        byte[] prev = Arrays.copyOfRange(chainedPlain, 0, GCM_TAG_LEN);
+        if (!MessageDigest.isEqual(prev, recvChainTag)) {
+            throw new IOException("Chaining check failed (replay/out-of-order)");
+        }
+
+        System.arraycopy(receivedTag, 0, recvChainTag, 0, GCM_TAG_LEN);
+        return Arrays.copyOfRange(chainedPlain, GCM_TAG_LEN, chainedPlain.length);
     }
 
     /**
