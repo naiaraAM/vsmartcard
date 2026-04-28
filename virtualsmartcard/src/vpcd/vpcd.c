@@ -898,7 +898,7 @@ struct vicc_ctx * vicc_init(const char *hostname, unsigned short port)
     }
 
     if (!hostname)
-        hostname = "middlepoint.test";
+        hostname = "localhost";
 
     ctx->hostname = strdup(hostname);
     if (!ctx->hostname) {

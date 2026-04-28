@@ -26,6 +26,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <arpa/inet.h>
+#endif
 #include <openssl/bn.h>
 #include <openssl/crypto.h>
 #include <openssl/ec.h>
@@ -57,8 +62,8 @@ static int clear_session_state(void);
 #define INVALID_SOCKET -1
 #endif
 
-#define DEFAULT_HANDSHAKE_HOST  "middlepoint.test"
-#define DEFAULT_HANDSHAKE_PORT  "80"
+#define DEFAULT_HANDSHAKE_HOST  "localhost"
+#define DEFAULT_HANDSHAKE_PORT  "5060"
 #define DEFAULT_KEY_DIR         ".config/vpcd"
 #define QR_SECRET_FILE          "vpcd_qr_secret.hex"
 #define SHARED_SECRET_FILE      "vpcd_shared_secret.hex"
@@ -1090,6 +1095,46 @@ static int get_device_id(char *out, size_t cap)
     return 0;
 }
 
+#ifndef _WIN32
+static int get_interface_ip(const char *ifname, char *out, size_t cap)
+{
+    int fd;
+    struct ifreq ifr;
+    struct sockaddr_in *sin;
+
+    if (!ifname || !out || cap == 0)
+        return -1;
+
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+        return -1;
+
+    memset(&ifr, 0, sizeof ifr);
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+
+    if (ioctl(fd, SIOCGIFADDR, &ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    close(fd);
+
+    sin = (struct sockaddr_in *)&ifr.ifr_addr;
+    if (inet_ntop(AF_INET, &sin->sin_addr, out, (socklen_t) cap) == NULL)
+        return -1;
+
+    return 0;
+}
+#else
+static int get_interface_ip(const char *ifname, char *out, size_t cap)
+{
+    (void) ifname;
+    if (cap > 0)
+        out[0] = '\0';
+    return -1;
+}
+#endif
+
 static int do_handshake(SOCKET *out_sock)
 {
     const char *role = "pc";
@@ -1314,9 +1359,13 @@ int main ( int argc , char *argv[] )
         printf("Pairing ID:     %s\n", pairing_id);
         printf("QR Secret:      %s\n", qr_secret);
         printf("On your NFC phone with the Remote Smart Card Reader app scan this code:\n");
+        char if_ip[64];
+        if_ip[0] = '\0';
+        (void) get_interface_ip("wlp2s0", if_ip, sizeof if_ip);
+
         int n = snprintf(uri, sizeof uri,
-                         "vpcd://pairing_id=%s&qr_secret=%s",
-                         pairing_id, qr_secret);
+                 "vpcd://pairing_id=%s&qr_secret=%s&ip=%s",
+                 pairing_id, qr_secret, if_ip);
         if (n < 0) {
             fprintf(stderr, "Failed to build QR URI\n");
             continue;
