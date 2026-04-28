@@ -27,10 +27,10 @@
 
         <EditTextPreference
             android:key="port"
-            android:defaultValue="80"
+            android:defaultValue="5060"
             android:title="DNS port"
             android:inputType="number"
-            android:hint="Default: 80" />
+            android:hint="Default: 5060" />
 
         <CheckBoxPreference
             android:key="listen"

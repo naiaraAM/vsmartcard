@@ -254,7 +254,8 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
 
     private void handleScannedURI(Uri uri) {
         try {
-            String pairing_id, qr_secret;
+            String pairing_id, qr_secret, host;
+            int port;
             byte[] qrSecretBytes;
             Spake2Plus.ProverConfig spake2PlusConfig;
             Spake2Plus.ProverRegistration spake2PlusRegistration;
@@ -263,6 +264,9 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
             // get fields by name
             pairing_id = getParam(uri, "pairing_id");
             qr_secret = getParam(uri, "qr_secret");
+            host = getParam(uri, "host");
+            String portStr = getParam(uri, "port");
+            
             qrSecretBytes = CryptoUtils.hexToBytes(Objects.requireNonNull(qr_secret, "Missing qr_secret"));
             qr_secret = CryptoUtils.bytesToHex(qrSecretBytes);
 
@@ -282,6 +286,12 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
             Log.i(getClass().getName(), "Prepared local SPAKE2+ shareP=" +
                     spake2PlusSession.shareP.length + " bytes");
 
+            if (host != null && !host.isEmpty()) {
+                Log.i(getClass().getName(), "Extracted host from QR: " + host);
+            }
+            if (portStr != null && !portStr.isEmpty()) {
+                Log.i(getClass().getName(), "Extracted port from QR: " + portStr);
+            }
 
             SharedPreferences SP = PreferenceManager.getDefaultSharedPreferences(this);
             SharedPreferences.Editor editor = SP.edit();
@@ -289,6 +299,18 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
             editor.putString("device_id", deviceId);
             editor.putString("qr_secret", qr_secret);
             editor.putBoolean("pairing_confirmed", false);
+            // Store host and port if provided in QR code
+            if (host != null && !host.isEmpty()) {
+                editor.putString("hostname", host);
+            }
+            if (portStr != null && !portStr.isEmpty()) {
+                try {
+                    port = Integer.parseInt(portStr);
+                    editor.putString("port", String.valueOf(port));
+                } catch (NumberFormatException e) {
+                    Log.w(getClass().getName(), "Invalid port number in QR: " + portStr);
+                }
+            }
             editor.apply();
             
             getFragmentManager().beginTransaction().replace(android.R.id.content,

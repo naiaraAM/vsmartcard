@@ -60,6 +60,7 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
 
     private static final int GCM_NONCE_LEN = 12;
     private static final int GCM_TAG_LEN = 16;
+    private static final int PADDED_FRAME_PLAIN_LEN = 2048;
 
     public static class VPCDWorkerParams {
         final String hostname;
@@ -76,7 +77,7 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
         }
     }
 
-    public static final int DEFAULT_PORT = 80;
+    public static final int DEFAULT_PORT = 5060;
     public static final String DEFAULT_HOSTNAME = "middlepoint.test";
     public static final boolean DEFAULT_LISTEN = false;
 
@@ -543,6 +544,19 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
         pairingId = sp.getString("pairing_id", null);
         deviceId = sp.getString("device_id", null);
         qrSecret = sp.getString("qr_secret", null);
+        
+        // Also load host and port from prefs if they were set by QR scan
+        String qrHost = sp.getString("hostname", null);
+        String qrPort = sp.getString("port", null);
+        
+        // Log if we found host/port in prefs (from QR scan)
+        if (qrHost != null && !qrHost.isEmpty()) {
+            Log.i(this.getClass().getName(), "Using host from QR: " + qrHost);
+        }
+        if (qrPort != null && !qrPort.isEmpty()) {
+            Log.i(this.getClass().getName(), "Using port from QR: " + qrPort);
+        }
+        
         if (pairingId == null || pairingId.isEmpty()
                 || deviceId == null || deviceId.isEmpty()
                 || qrSecret == null || qrSecret.isEmpty()) {
@@ -683,7 +697,12 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
         if (sharedSecret == null) {
             throw new IllegalStateException("Shared secret not established");
         }
-        byte[] plain = new byte[data.length + 2];
+
+        if (data.length > PADDED_FRAME_PLAIN_LEN - 2) {
+            throw new IOException("Frame too large");
+        }
+
+        byte[] plain = new byte[PADDED_FRAME_PLAIN_LEN];
         plain[0] = (byte) (data.length >> 8);
         plain[1] = (byte) (data.length & 0xff);
         System.arraycopy(data, 0, plain, 2, data.length);
