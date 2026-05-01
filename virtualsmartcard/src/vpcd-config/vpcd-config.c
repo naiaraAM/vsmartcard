@@ -1364,8 +1364,8 @@ int main ( int argc , char *argv[] )
         (void) get_interface_ip("wlp2s0", if_ip, sizeof if_ip);
 
         int n = snprintf(uri, sizeof uri,
-                 "vpcd://pairing_id=%s&qr_secret=%s&ip=%s",
-                 pairing_id, qr_secret, if_ip);
+                 "vpcd://pairing_id=%s&qr_secret=%s&ip=%s&port=%s",
+                 pairing_id, qr_secret, if_ip, DEFAULT_HANDSHAKE_PORT);
         if (n < 0) {
             fprintf(stderr, "Failed to build QR URI\n");
             continue;
