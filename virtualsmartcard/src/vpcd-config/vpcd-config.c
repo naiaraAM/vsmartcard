@@ -70,9 +70,9 @@ static int clear_session_state(void);
 #define PAIRING_ID_FILE         "vpcd_pairing_id.hex"
 #define DEVICE_ID_FILE          "vpcd_device_id.hex"
 
-static char device_id[64];
-static char pairing_id[64];
-static char qr_secret[64];
+static char device_id[33];
+static char pairing_id[33];
+static char qr_secret[33];
 
 #define SPAKE2PLUS_CONTEXT               "vsmartcard-spake2plus-v1"
 #define SPAKE2PLUS_CIPHERSUITE           "P-256-SHA256-HKDF-HMAC-SHA256"
