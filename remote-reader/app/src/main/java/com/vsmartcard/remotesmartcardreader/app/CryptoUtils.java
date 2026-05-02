@@ -30,7 +30,6 @@ public class CryptoUtils {
      * @return the hexadecimal string representation of the byte array
      */
     public static String bytesToHex(byte[] bytes) {
-        // convert byte array to hex string
         StringBuilder sb = new StringBuilder(bytes.length * 2);
         for (byte b : bytes) {
             sb.append(String.format("%02x", b));

@@ -167,14 +167,6 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
             super.onCreate(savedInstanceState);
             addPreferencesFromResource(R.xml.settings);
             setHasOptionsMenu(true);
-
-            // Bind the summaries of EditText/List/Dialog/Ringtone preferences
-            // to their values. When their values change, their summaries are
-            // updated to reflect the new value, per the Android Design
-            // guidelines.
-            // bindPreferenceSummaryToValue(findPreference("hostname"));
-            // bindPreferenceSummaryToValue(findPreference("port"));
-
             
             CryptoUtils.ensureConscrypt();
             getOrCreateDeviceId(getActivity());
@@ -261,7 +253,6 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
             Spake2Plus.ProverRegistration spake2PlusRegistration;
             Spake2Plus.ProverSession spake2PlusSession;
 
-            // get fields by name
             pairing_id = getParam(uri, "pairing_id");
             qr_secret = getParam(uri, "qr_secret");
             host = getParam(uri, "host");
@@ -342,7 +333,6 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
     }
 
     private static String getOrCreateDeviceId(Context ctx) {
-        // try to get existing device id or create a new one if not present
         SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(ctx);
         String existing = sp.getString("device_id", null);
         if (existing != null && !existing.isEmpty()) {
@@ -362,7 +352,6 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
     }
 
     private static String getParam(Uri uri, String key) {
-        // first try to get the parameter by name
         String val = uri.getQueryParameter(key);
         if (val != null) {
             return val;

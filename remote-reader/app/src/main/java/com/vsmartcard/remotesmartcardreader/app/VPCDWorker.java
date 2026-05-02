@@ -545,11 +545,9 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
         deviceId = sp.getString("device_id", null);
         qrSecret = sp.getString("qr_secret", null);
         
-        // Also load host and port from prefs if they were set by QR scan
         String qrHost = sp.getString("hostname", null);
         String qrPort = sp.getString("port", null);
         
-        // Log if we found host/port in prefs (from QR scan)
         if (qrHost != null && !qrHost.isEmpty()) {
             Log.i(this.getClass().getName(), "Using host from QR: " + qrHost);
         }
@@ -650,7 +648,6 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
                     }
                     return;
                 }
-                // Not a status response; buffer it so it can be processed later.
                 bufferedJsonLines.addLast(line);
             } catch (org.json.JSONException ignored) { }
         }
