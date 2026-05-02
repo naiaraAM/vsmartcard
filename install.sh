@@ -3,7 +3,6 @@
 git submodule update --init --recursive
 cd virtualsmartcard/
 autoreconf --verbose --install
+./configure
 make
 sudo make install
-
-sudo usermod -a -G pcscd $USER
