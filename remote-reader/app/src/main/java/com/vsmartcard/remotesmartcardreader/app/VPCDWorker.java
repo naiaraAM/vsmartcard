@@ -96,6 +96,8 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
     private String pairingId;
     private String deviceId;
     private String qrSecret;
+    private String ip;
+    private String port;
     private Spake2Plus.ProverConfig spake2PlusConfig;
     private Spake2Plus.ProverSession spake2PlusSession;
     private Context appContext;
@@ -545,14 +547,14 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
         deviceId = sp.getString("device_id", null);
         qrSecret = sp.getString("qr_secret", null);
         
-        String qrHost = sp.getString("hostname", null);
-        String qrPort = sp.getString("port", null);
+        ip = sp.getString("ip", null);
+        port = sp.getString("port", null);
         
-        if (qrHost != null && !qrHost.isEmpty()) {
-            Log.i(this.getClass().getName(), "Using host from QR: " + qrHost);
+        if (ip != null && !ip.isEmpty()) {
+            Log.i(this.getClass().getName(), "Using host from QR: " + ip);
         }
-        if (qrPort != null && !qrPort.isEmpty()) {
-            Log.i(this.getClass().getName(), "Using port from QR: " + qrPort);
+        if (port != null && !port.isEmpty()) {
+            Log.i(this.getClass().getName(), "Using port from QR: " + port);
         }
         
         if (pairingId == null || pairingId.isEmpty()

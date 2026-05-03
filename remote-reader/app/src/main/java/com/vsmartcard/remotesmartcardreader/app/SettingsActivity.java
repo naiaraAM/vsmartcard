@@ -178,6 +178,8 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
             bindPreferenceSummaryToValue(findPreference("pairing_id"));
             bindPreferenceSummaryToValue(findPreference("device_id"));
             bindPreferenceSummaryToValue(findPreference("qr_secret"));
+            bindPreferenceSummaryToValue(findPreference("ip"));
+            bindPreferenceSummaryToValue(findPreference("port"));
 
 
             Preference nfcSettings = findPreference("nfcSettings");
@@ -246,7 +248,7 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
 
     private void handleScannedURI(Uri uri) {
         try {
-            String pairing_id, qr_secret, host;
+            String pairing_id, qr_secret, ip;
             int port;
             byte[] qrSecretBytes;
             Spake2Plus.ProverConfig spake2PlusConfig;
@@ -255,7 +257,7 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
 
             pairing_id = getParam(uri, "pairing_id");
             qr_secret = getParam(uri, "qr_secret");
-            host = getParam(uri, "host");
+            ip = getParam(uri, "ip");
             String portStr = getParam(uri, "port");
             
             qrSecretBytes = CryptoUtils.hexToBytes(Objects.requireNonNull(qr_secret, "Missing qr_secret"));
@@ -277,8 +279,8 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
             Log.i(getClass().getName(), "Prepared local SPAKE2+ shareP=" +
                     spake2PlusSession.shareP.length + " bytes");
 
-            if (host != null && !host.isEmpty()) {
-                Log.i(getClass().getName(), "Extracted host from QR: " + host);
+            if (ip != null && !ip.isEmpty()) {
+                Log.i(getClass().getName(), "Extracted host from QR: " + ip);
             }
             if (portStr != null && !portStr.isEmpty()) {
                 Log.i(getClass().getName(), "Extracted port from QR: " + portStr);
@@ -289,10 +291,12 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
             editor.putString("pairing_id", pairing_id);
             editor.putString("device_id", deviceId);
             editor.putString("qr_secret", qr_secret);
+            editor.putString("ip", ip);
+            editor.putString("port", portStr);
             editor.putBoolean("pairing_confirmed", false);
             // Store host and port if provided in QR code
-            if (host != null && !host.isEmpty()) {
-                editor.putString("hostname", host);
+            if (ip != null && !ip.isEmpty()) {
+                editor.putString("ip", ip);
             }
             if (portStr != null && !portStr.isEmpty()) {
                 try {

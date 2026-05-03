@@ -19,7 +19,7 @@
         </Preference>
 
         <EditTextPreference
-            android:key="hostname"
+            android:key="ip"
             android:defaultValue="middlepoint.test"
             android:title="DNS name"
             android:hint="URL or IP address"

@@ -198,7 +198,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
     private void vpcdConnect(SCReader scReader) {
         final SharedPreferences SP = PreferenceManager.getDefaultSharedPreferences(this);
         final int port = Integer.parseInt(SP.getString("port", Integer.toString(VPCDWorker.DEFAULT_PORT)));
-        final String hostname = SP.getString("hostname", VPCDWorker.DEFAULT_HOSTNAME);
+        final String     = SP.getString("ip", VPCDWorker.DEFAULT_HOSTNAME);
         final boolean listen = SP.getBoolean("listen", VPCDWorker.DEFAULT_LISTEN);
         vpcdTest = new VPCDWorker();
         vpcdTest.execute(new VPCDWorker.VPCDWorkerParams(hostname, port, scReader, listen, getApplicationContext()));
