@@ -147,8 +147,8 @@ static void vpcd_load_mp_defaults(void)
     const char *h = getenv("VPCD_MP_HOST");
     const char *p = getenv("VPCD_MP_PORT");
 
-    g_mp_host = (h && *h) ? h : "localhost";
-    g_mp_port = 5060;
+    g_mp_host = (h && *h) ? h : "193.40.155.72";
+    g_mp_port = 8085;
 
     if (p && *p) {
         unsigned long v = strtoul(p, NULL, 10);

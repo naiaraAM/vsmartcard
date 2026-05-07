@@ -62,8 +62,8 @@ static int clear_session_state(void);
 #define INVALID_SOCKET -1
 #endif
 
-#define DEFAULT_HANDSHAKE_HOST  "localhost"
-#define DEFAULT_HANDSHAKE_PORT  "5060"
+#define DEFAULT_HANDSHAKE_HOST  "193.40.155.72"
+#define DEFAULT_HANDSHAKE_PORT  "8085"
 #define DEFAULT_KEY_DIR         ".config/vpcd"
 #define QR_SECRET_FILE          "vpcd_qr_secret.hex"
 #define SHARED_SECRET_FILE      "vpcd_shared_secret.hex"
@@ -1359,13 +1359,10 @@ int main ( int argc , char *argv[] )
         printf("Pairing ID:     %s\n", pairing_id);
         printf("QR Secret:      %s\n", qr_secret);
         printf("On your NFC phone with the Remote Smart Card Reader app scan this code:\n");
-        char if_ip[64];
-        if_ip[0] = '\0';
-        (void) get_interface_ip("wlp2s0", if_ip, sizeof if_ip);
 
         int n = snprintf(uri, sizeof uri,
                  "vpcd://pairing_id=%s&qr_secret=%s&ip=%s&port=%s",
-                 pairing_id, qr_secret, if_ip, DEFAULT_HANDSHAKE_PORT);
+                 pairing_id, qr_secret, DEFAULT_HANDSHAKE_HOST, DEFAULT_HANDSHAKE_PORT);
         if (n < 0) {
             fprintf(stderr, "Failed to build QR URI\n");
             continue;
