@@ -3,6 +3,6 @@
 git submodule update --init --recursive
 cd virtualsmartcard/
 autoreconf --verbose --install
-./configure
+#./configure
 make
 sudo make install
