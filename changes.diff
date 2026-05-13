@@ -1,0 +1,4894 @@
+diff --git a/install.sh b/install.sh
+new file mode 100755
+index 0000000..fff6a3e
+--- /dev/null
++++ b/install.sh
+@@ -0,0 +1,9 @@
++#!/bin/bash
++
++git submodule update --init --recursive
++cd virtualsmartcard/
++autoreconf --verbose --install
++# Uncomment for first installation
++#./configure
++make
++sudo make install
+diff --git a/remote-reader/app/build.gradle b/remote-reader/app/build.gradle
+index a6d8040..58c6bfb 100644
+--- a/remote-reader/app/build.gradle
++++ b/remote-reader/app/build.gradle
+@@ -36,4 +36,8 @@ dependencies {
+     implementation 'androidx.legacy:legacy-support-v4:1.0.0'
+ 
+     implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
++
++    implementation 'org.conscrypt:conscrypt-android:2.5.2'
++    implementation "androidx.security:security-crypto:1.1.0-alpha06"
++
+ }
+diff --git a/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/CryptoUtils.java b/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/CryptoUtils.java
+new file mode 100644
+index 0000000..7ce6cf9
+--- /dev/null
++++ b/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/CryptoUtils.java
+@@ -0,0 +1,137 @@
++package com.vsmartcard.remotesmartcardreader.app;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++import android.util.Base64;
++import android.util.Log;
++
++import androidx.security.crypto.EncryptedSharedPreferences;
++import androidx.security.crypto.MasterKey; 
++
++import java.security.Security;
++
++
++import org.conscrypt.Conscrypt;
++
++/**
++ * Utility class for cryptographic operations, including key generation, encoding, and secure storage.
++ */
++public class CryptoUtils {
++
++    private static final String TAG =              "CryptoUtils";
++    private static final String SEC_PREFS =         "crypto_prefs";
++    private static final String SHARED_SECRET =      "shared_secret";
++
++    private CryptoUtils() {}
++
++    /**
++     * Convert a byte array to a hexadecimal string.
++     * @param bytes the byte array to convert
++     * @return the hexadecimal string representation of the byte array
++     */
++    public static String bytesToHex(byte[] bytes) {
++        StringBuilder sb = new StringBuilder(bytes.length * 2);
++        for (byte b : bytes) {
++            sb.append(String.format("%02x", b));
++        }
++        return sb.toString();
++    }
++
++    /**
++     * Convert a hexadecimal string to a byte array.
++     * @param hex the hexadecimal string to convert
++     * @return the decoded byte array
++     * @throws IllegalArgumentException if the input is null, has odd length, or contains non-hex characters
++     */
++    public static byte[] hexToBytes(String hex) {
++        if (hex == null) {
++            throw new IllegalArgumentException("hex is null");
++        }
++
++        int len = hex.length();
++        if ((len % 2) != 0) {
++            throw new IllegalArgumentException("hex length must be even");
++        }
++
++        byte[] out = new byte[len / 2];
++        for (int i = 0; i < len; i += 2) {
++            int hi = Character.digit(hex.charAt(i), 16);
++            int lo = Character.digit(hex.charAt(i + 1), 16);
++            if (hi < 0 || lo < 0) {
++                throw new IllegalArgumentException("hex contains non-hex characters");
++            }
++            out[i / 2] = (byte) ((hi << 4) | lo);
++        }
++        return out;
++    }
++
++
++    /**
++     * Ensure that the Conscrypt provider is available.
++     */
++    public static void ensureConscrypt() {
++        if (Security.getProvider("Conscrypt") == null) {
++            Security.insertProviderAt(Conscrypt.newProvider(), 1);
++        }
++    }
++
++    /**
++     * Get an instance of EncryptedSharedPreferences for secure storage of sensitive data.
++     * @param ctx the application context
++     * @return the EncryptedSharedPreferences instance
++     * @throws Exception if secure preference initialization fails
++     */
++    private static SharedPreferences securePrefs(Context ctx) throws Exception {
++        try {
++            return createSecurePrefs(ctx);
++        } catch (Exception e) {
++            Log.w(TAG, "Secure preferences could not be opened. Resetting encrypted key storage.", e);
++            resetEncryptedKeyStorage(ctx);
++            return createSecurePrefs(ctx);
++        }
++    }
++
++    private static SharedPreferences createSecurePrefs(Context ctx) throws Exception {
++        MasterKey masterKey = new MasterKey.Builder(ctx)
++            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
++            .build();
++
++        return EncryptedSharedPreferences.create(
++            ctx,
++            SEC_PREFS,
++            masterKey,
++            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
++            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
++        );
++    }
++
++    /**
++     * Store the established shared secret (K_shared) securely.
++     * This is used as the AES-256 key material for the encrypted channel.
++     */
++    public static void storeSharedSecret(Context ctx, byte[] sharedSecret) throws Exception {
++        if (sharedSecret == null || sharedSecret.length == 0) {
++            throw new IllegalArgumentException("sharedSecret is empty");
++        }
++        String b64 = Base64.encodeToString(sharedSecret, Base64.NO_WRAP);
++        SharedPreferences sp = securePrefs(ctx);
++        sp.edit().putString(SHARED_SECRET, b64).apply();
++    }
++
++    /**
++     * Load the stored shared secret (K_shared), or null if missing.
++     */
++    public static byte[] loadSharedSecret(Context ctx) throws Exception {
++        SharedPreferences sp = securePrefs(ctx);
++        String b64 = sp.getString(SHARED_SECRET, null);
++        if (b64 == null || b64.isEmpty()) {
++            return null;
++        }
++        return Base64.decode(b64, Base64.NO_WRAP);
++    }
++
++    private static void resetEncryptedKeyStorage(Context ctx) {
++        SharedPreferences raw = ctx.getSharedPreferences(SEC_PREFS, Context.MODE_PRIVATE);
++        raw.edit().clear().commit();
++    }
++}
+diff --git a/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/MainActivity.java b/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/MainActivity.java
+index dd6080e..6b9f3a8 100644
+--- a/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/MainActivity.java
++++ b/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/MainActivity.java
+@@ -198,10 +198,10 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
+     private void vpcdConnect(SCReader scReader) {
+         final SharedPreferences SP = PreferenceManager.getDefaultSharedPreferences(this);
+         final int port = Integer.parseInt(SP.getString("port", Integer.toString(VPCDWorker.DEFAULT_PORT)));
+-        final String hostname = SP.getString("hostname", VPCDWorker.DEFAULT_HOSTNAME);
++        final String     = SP.getString("ip", VPCDWorker.DEFAULT_HOSTNAME);
+         final boolean listen = SP.getBoolean("listen", VPCDWorker.DEFAULT_LISTEN);
+         vpcdTest = new VPCDWorker();
+-        vpcdTest.execute(new VPCDWorker.VPCDWorkerParams(hostname, port, scReader, listen));
++        vpcdTest.execute(new VPCDWorker.VPCDWorkerParams(hostname, port, scReader, listen, getApplicationContext()));
+     }
+ 
+     private void vpcdDisconnect() {
+@@ -214,19 +214,6 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
+     @Override
+     public void onResume() {
+         super.onResume();
+-        /* See https://github.com/frankmorgner/vsmartcard/issues/281
+-        Intent intent = getIntent();
+-        // Check to see that the Activity started due to a discovered tag
+-        if (NfcAdapter.ACTION_TECH_DISCOVERED.equals(intent.getAction())) {
+-            vpcdDisconnect();
+-            NFCReader nfcReader = NFCReader.get(intent, this);
+-            if (nfcReader != null) {
+-                vpcdConnect(nfcReader);
+-            } else {
+-                super.onNewIntent(intent);
+-            }
+-        }
+-        */
+         enableReaderMode();
+     }
+ 
+diff --git a/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/SettingsActivity.java b/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/SettingsActivity.java
+index 6a2a53f..40face8 100644
+--- a/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/SettingsActivity.java
++++ b/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/SettingsActivity.java
+@@ -33,6 +33,7 @@ import android.provider.Settings;
+ import android.preference.PreferenceFragment;
+ import android.preference.PreferenceManager;
+ import android.view.MenuItem;
++import android.view.View;
+ 
+ import androidx.appcompat.app.ActionBar;
+ 
+@@ -40,6 +41,8 @@ import com.google.android.material.snackbar.Snackbar;
+ import com.google.zxing.integration.android.IntentIntegrator;
+ import com.google.zxing.integration.android.IntentResult;
+ 
++import com.example.android.common.logger.Log;
++
+ import java.util.Objects;
+ 
+ /**
+@@ -140,6 +143,9 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
+      * @see #sBindPreferenceSummaryToValueListener
+      */
+     private static void bindPreferenceSummaryToValue(Preference preference) {
++        if (preference == null) {
++            return;
++        }
+         // Set the listener to watch for value changes.
+         preference.setOnPreferenceChangeListener(sBindPreferenceSummaryToValueListener);
+ 
+@@ -161,33 +167,52 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
+             super.onCreate(savedInstanceState);
+             addPreferencesFromResource(R.xml.settings);
+             setHasOptionsMenu(true);
+-
+-            // Bind the summaries of EditText/List/Dialog/Ringtone preferences
+-            // to their values. When their values change, their summaries are
+-            // updated to reflect the new value, per the Android Design
+-            // guidelines.
+-            bindPreferenceSummaryToValue(findPreference("hostname"));
+-            bindPreferenceSummaryToValue(findPreference("port"));
++            
++            CryptoUtils.ensureConscrypt();
++            getOrCreateDeviceId(getActivity());
++            
+             bindPreferenceSummaryToValue(findPreference("delay"));
+             bindPreferenceSummaryToValue(findPreference("timeout"));
+ 
++            // add new fields
++            bindPreferenceSummaryToValue(findPreference("pairing_id"));
++            bindPreferenceSummaryToValue(findPreference("device_id"));
++            bindPreferenceSummaryToValue(findPreference("qr_secret"));
++            bindPreferenceSummaryToValue(findPreference("ip"));
++            bindPreferenceSummaryToValue(findPreference("port"));
++
++
+             Preference nfcSettings = findPreference("nfcSettings");
+-            nfcSettings.setOnPreferenceClickListener(new Preference.OnPreferenceClickListener() {
+-                public boolean onPreferenceClick(Preference preference) {
+-                    Intent viewIntent = new Intent(Settings.ACTION_NFC_SETTINGS);
+-                    startActivity(viewIntent);
+-                    return true;
+-                }
+-            });
++            if (nfcSettings != null) {
++                nfcSettings.setOnPreferenceClickListener(new Preference.OnPreferenceClickListener() {
++                    public boolean onPreferenceClick(Preference preference) {
++                        Intent viewIntent = new Intent(Settings.ACTION_NFC_SETTINGS);
++                        startActivity(viewIntent);
++                        return true;
++                    }
++                });
++            }
+ 
+             Preference scan = findPreference("scan");
+-            scan.setOnPreferenceClickListener(new Preference.OnPreferenceClickListener() {
+-                public boolean onPreferenceClick(Preference preference) {
+-                    new IntentIntegrator(getActivity()).initiateScan();
+-                    return true;
+-                }
+-            });
++            if (scan != null) {
++                scan.setOnPreferenceClickListener(new Preference.OnPreferenceClickListener() {
++                    public boolean onPreferenceClick(Preference preference) {
++                        IntentIntegrator.forFragment(VPCDPreferenceFragment.this).initiateScan();
++                        return true;
++                    }
++                });
++            }
+         }
++
++        @Override
++        public void onActivityResult(int requestCode, int resultCode, Intent intent) {
++            if (getActivity() instanceof SettingsActivity
++                    && ((SettingsActivity) getActivity()).handleScanResult(requestCode, resultCode, intent)) {
++                return;
++            }
++            super.onActivityResult(requestCode, resultCode, intent);
++        }
++
+         @Override
+         public boolean onOptionsItemSelected(MenuItem item) {
+             int id = item.getItemId();
+@@ -200,32 +225,96 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
+ 
+     }
+ 
++    @Override
+     public void onActivityResult(int requestCode, int resultCode, Intent intent) {
++        if (!handleScanResult(requestCode, resultCode, intent)) {
++            super.onActivityResult(requestCode, resultCode, intent);
++        }
++    }
++
++    boolean handleScanResult(int requestCode, int resultCode, Intent intent) {
+         IntentResult scanResult = IntentIntegrator.parseActivityResult(requestCode, resultCode, intent);
+-        if (requestCode == IntentIntegrator.REQUEST_CODE) {
+-            if (resultCode != RESULT_CANCELED) {
+-                handleScannedURI(Uri.parse(scanResult.getContents()));
+-            }
++        if (scanResult == null) {
++            return false;
+         }
++
++        if (resultCode == RESULT_CANCELED || scanResult.getContents() == null || scanResult.getContents().isEmpty()) {
++            return true;
++        }
++
++        handleScannedURI(Uri.parse(scanResult.getContents()));
++        return true;
+     }
+ 
+     private void handleScannedURI(Uri uri) {
+         try {
+-            String h, p;
+-            h = uri.getHost();
+-            int _p = uri.getPort();
+-            if (_p < 0) {
+-                _p = VPCDWorker.DEFAULT_PORT;
++            String pairing_id, qr_secret, ip;
++            int port;
++            byte[] qrSecretBytes;
++            Spake2Plus.ProverConfig spake2PlusConfig;
++            Spake2Plus.ProverRegistration spake2PlusRegistration;
++            Spake2Plus.ProverSession spake2PlusSession;
++
++            pairing_id = getParam(uri, "pairing_id");
++            qr_secret = getParam(uri, "qr_secret");
++            ip = getParam(uri, "ip");
++            String portStr = getParam(uri, "port");
++            
++            qrSecretBytes = CryptoUtils.hexToBytes(Objects.requireNonNull(qr_secret, "Missing qr_secret"));
++            qr_secret = CryptoUtils.bytesToHex(qrSecretBytes);
++
++            CryptoUtils.ensureConscrypt();
++            String deviceId = getOrCreateDeviceId(this);
++            spake2PlusConfig = Spake2Plus.buildProverConfig(deviceId, pairing_id);
++            spake2PlusRegistration = Spake2Plus.deriveProverRegistration(qrSecretBytes, spake2PlusConfig);
++            spake2PlusSession = Spake2Plus.beginProverSession(spake2PlusRegistration);
++
++            Log.i(getClass().getName(), "Prepared SPAKE2+ Prover profile " +
++                    spake2PlusConfig.ciphersuite +
++                    " idProver=" + spake2PlusConfig.idProver +
++                    " idVerifier=" + spake2PlusConfig.idVerifier);
++            Log.i(getClass().getName(), "Derived SPAKE2+ Prover registration w0=" +
++                    spake2PlusRegistration.w0.length + " bytes w1=" +
++                    spake2PlusRegistration.w1.length + " bytes");
++            Log.i(getClass().getName(), "Prepared local SPAKE2+ shareP=" +
++                    spake2PlusSession.shareP.length + " bytes");
++
++            if (ip != null && !ip.isEmpty()) {
++                Log.i(getClass().getName(), "Extracted host from QR: " + ip);
+             }
+-            p = Integer.toString(_p);
++            if (portStr != null && !portStr.isEmpty()) {
++                Log.i(getClass().getName(), "Extracted port from QR: " + portStr);
++            }
++
+             SharedPreferences SP = PreferenceManager.getDefaultSharedPreferences(this);
+-            SP.edit().putString("hostname", h).apply();
+-            SP.edit().putString("port", p).apply();
++            SharedPreferences.Editor editor = SP.edit();
++            editor.putString("pairing_id", pairing_id);
++            editor.putString("device_id", deviceId);
++            editor.putString("qr_secret", qr_secret);
++            editor.putString("ip", ip);
++            editor.putString("port", portStr);
++            editor.putBoolean("pairing_confirmed", false);
++            // Store host and port if provided in QR code
++            if (ip != null && !ip.isEmpty()) {
++                editor.putString("ip", ip);
++            }
++            if (portStr != null && !portStr.isEmpty()) {
++                try {
++                    port = Integer.parseInt(portStr);
++                    editor.putString("port", String.valueOf(port));
++                } catch (NumberFormatException e) {
++                    Log.w(getClass().getName(), "Invalid port number in QR: " + portStr);
++                }
++            }
++            editor.apply();
++            
+             getFragmentManager().beginTransaction().replace(android.R.id.content,
+                     new VPCDPreferenceFragment()).commit();
++
++            showMessage("Configuration imported");
+         } catch (Exception e) {
+-            Snackbar.make(Objects.requireNonNull(this.getCurrentFocus()), "Could not import configuration", Snackbar.LENGTH_LONG)
+-                    .setAction("Action", null).show();
++            Log.e(getClass().getName(), "Could not import configuration", e);
++            showMessage("Could not import configuration");
+         }
+     }
+ 
+@@ -246,4 +335,53 @@ public class SettingsActivity extends AppCompatPreferenceActivity {
+         // onResume gets called after this to handle the intent
+         setIntent(intent);
+     }
++
++    private static String getOrCreateDeviceId(Context ctx) {
++        SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(ctx);
++        String existing = sp.getString("device_id", null);
++        if (existing != null && !existing.isEmpty()) {
++            return existing;
++        }
++
++        byte[] bytes = new byte[16];
++        new java.security.SecureRandom().nextBytes(bytes);
++        StringBuilder sb = new StringBuilder();
++        for (byte b : bytes) {
++            sb.append(String.format("%02x", b));
++        }
++
++        String id = sb.toString();
++        sp.edit().putString("device_id", id).apply();
++        return id;
++    }
++
++    private static String getParam(Uri uri, String key) {
++        String val = uri.getQueryParameter(key);
++        if (val != null) {
++            return val;
++        }
++
++        String ssp = uri.getSchemeSpecificPart();
++        if (ssp == null) {
++            return null;
++        }
++
++        if (ssp.startsWith("//")) {
++            ssp = ssp.substring(2);
++        }
++        if (ssp.startsWith("?")) {
++            ssp = ssp.substring(1);
++        }
++
++        Uri tmp = Uri.parse("http://dummy/?" + ssp);
++        return tmp.getQueryParameter(key);
++    }
++
++
++    private void showMessage(String message) {
++        View content = findViewById(android.R.id.content);
++        if (content != null) {
++            Snackbar.make(content, message, Snackbar.LENGTH_LONG).show();
++        }
++    }
+ }
+diff --git a/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/Spake2Plus.java b/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/Spake2Plus.java
+new file mode 100644
+index 0000000..bdc3d31
+--- /dev/null
++++ b/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/Spake2Plus.java
+@@ -0,0 +1,508 @@
++package com.vsmartcard.remotesmartcardreader.app;
++
++import java.io.ByteArrayOutputStream;
++import java.math.BigInteger;
++import java.nio.charset.StandardCharsets;
++import java.security.GeneralSecurityException;
++import java.security.MessageDigest;
++import java.util.Arrays;
++import java.security.SecureRandom;
++
++import javax.crypto.Mac;
++import javax.crypto.spec.SecretKeySpec;
++
++/**
++ * Application profile for SPAKE2+.
++ * This centralizes the fixed protocol parameters and the identities used by the app as Prover.
++ */
++final class Spake2Plus {
++
++    static final String CIPHERSUITE = "P-256-SHA256-HKDF-HMAC-SHA256";
++    static final String CONTEXT = "vsmartcard-spake2plus-v1";
++    private static final String REGISTRATION_INFO = "vsmartcard-spake2plus-registration-v1";
++    private static final String CONFIRMATION_INFO = "ConfirmationKeys";
++    private static final String SHARED_KEY_INFO = "SharedKey";
++    private static final String HMAC_SHA256 = "HmacSHA256";
++    private static final int P256_SCALAR_LENGTH = 32;
++    private static final int P256_COMPRESSED_POINT_LENGTH = 33;
++    private static final int REGISTRATION_HALF_LENGTH = 40;
++    private static final int REGISTRATION_OUTPUT_LENGTH = REGISTRATION_HALF_LENGTH * 2;
++    private static final SecureRandom RNG = new SecureRandom();
++    private static final BigInteger P256_FIELD_PRIME =
++            new BigInteger("FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF", 16);
++    private static final BigInteger P256_A = P256_FIELD_PRIME.subtract(BigInteger.valueOf(3));
++    private static final BigInteger P256_B =
++            new BigInteger("5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B", 16);
++    private static final BigInteger P256_ORDER =
++            new BigInteger("FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551", 16);
++    private static final BigInteger P256_GENERATOR_X =
++            new BigInteger("6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296", 16);
++    private static final BigInteger P256_GENERATOR_Y =
++            new BigInteger("4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5", 16);
++    private static final byte[] P256_M_COMPRESSED = CryptoUtils.hexToBytes(
++            "02886e2f97ace46e55ba9dd7242579f2993b64e16ef3dcab95afd497333d8fa12f");
++        private static final byte[] P256_N_COMPRESSED = CryptoUtils.hexToBytes(
++            "03d8bbd6c639c62937b04d997f38c3770719c629d7014d49a24b4f98baa1292b49");
++    private static final AffinePoint P256_GENERATOR = new AffinePoint(P256_GENERATOR_X, P256_GENERATOR_Y);
++    private static final AffinePoint P256_M_POINT = decodeCompressedPoint(P256_M_COMPRESSED);
++        private static final AffinePoint P256_N_POINT = decodeCompressedPoint(P256_N_COMPRESSED);
++
++    private Spake2Plus() {}
++
++    static ProverConfig buildProverConfig(String deviceId, String pairingId) {
++        if (deviceId == null || deviceId.isEmpty()) {
++            throw new IllegalArgumentException("Missing device_id for SPAKE2+ Prover");
++        }
++        if (pairingId == null || pairingId.isEmpty()) {
++            throw new IllegalArgumentException("Missing pairing_id for SPAKE2+ Verifier identity");
++        }
++        return new ProverConfig(CIPHERSUITE, CONTEXT, deviceId, pairingId);
++    }
++
++    static ProverRegistration deriveProverRegistration(byte[] qrSecret, ProverConfig config) {
++        if (config == null) {
++            throw new IllegalArgumentException("Missing SPAKE2+ Prover config");
++        }
++        if (qrSecret == null || qrSecret.length == 0) {
++            throw new IllegalArgumentException("Missing qr_secret bytes for SPAKE2+ registration");
++        }
++
++        byte[] registrationInput = encodeLengthPrefixed(qrSecret,
++                config.idProverBytes(),
++                config.idVerifierBytes());
++        byte[] registrationSalt = encodeLengthPrefixed(config.contextBytes(), config.ciphersuiteBytes());
++
++        /*
++         * RFC 9383 recommends a PBKDF for passwords entered by humans.
++         * Our qr_secret is already random high-entropy input from the QR, so this profile
++         * uses HKDF-SHA256 to expand the registration input into enough material for w0 and w1.
++         */
++        byte[] expanded = hkdfSha256(
++                registrationSalt,
++                registrationInput,
++                REGISTRATION_INFO.getBytes(StandardCharsets.UTF_8),
++                REGISTRATION_OUTPUT_LENGTH);
++
++        byte[] w0 = reduceScalar(Arrays.copyOfRange(expanded, 0, REGISTRATION_HALF_LENGTH));
++        byte[] w1 = reduceScalar(Arrays.copyOfRange(expanded, REGISTRATION_HALF_LENGTH, REGISTRATION_OUTPUT_LENGTH));
++
++        Arrays.fill(expanded, (byte) 0);
++        Arrays.fill(registrationInput, (byte) 0);
++
++        return new ProverRegistration(config, w0, w1);
++    }
++
++    static ProverSession beginProverSession(ProverRegistration registration) {
++        if (registration == null) {
++            throw new IllegalArgumentException("Missing SPAKE2+ Prover registration");
++        }
++
++        byte[] x = generateEphemeralScalar();
++        BigInteger xScalar = new BigInteger(1, x);
++        BigInteger w0Scalar = new BigInteger(1, registration.w0);
++
++        AffinePoint xP = scalarMultiply(P256_GENERATOR, xScalar);
++        AffinePoint w0M = scalarMultiply(P256_M_POINT, w0Scalar);
++        AffinePoint sharePPoint = addPoints(xP, w0M);
++        byte[] shareP = encodeCompressedPoint(sharePPoint);
++
++        return new ProverSession(registration, x, shareP);
++    }
++
++    static ProverResult finishProverSession(ProverSession session, byte[] shareV, byte[] confirmV)
++            throws GeneralSecurityException {
++        if (session == null || session.registration == null || session.registration.config == null) {
++            throw new IllegalArgumentException("Missing SPAKE2+ Prover session");
++        }
++        if (shareV == null || shareV.length != P256_COMPRESSED_POINT_LENGTH) {
++            throw new IllegalArgumentException("shareV must be a compressed P-256 point");
++        }
++        if (confirmV == null || confirmV.length != 32) {
++            throw new IllegalArgumentException("confirmV must be 32 bytes (HMAC-SHA256)");
++        }
++
++        ProverRegistration reg = session.registration;
++        ProverConfig cfg = reg.config;
++
++        AffinePoint shareVPoint = decodeCompressedPoint(shareV);
++
++        BigInteger w0Scalar = new BigInteger(1, reg.w0);
++        BigInteger w1Scalar = new BigInteger(1, reg.w1);
++        BigInteger xScalar = new BigInteger(1, session.x);
++
++        AffinePoint w0N = scalarMultiply(P256_N_POINT, w0Scalar);
++        AffinePoint yP = subtractPoints(shareVPoint, w0N);
++        if (yP.isInfinity()) {
++            throw new GeneralSecurityException("Invalid shareV (yP at infinity)");
++        }
++
++        AffinePoint zPoint = scalarMultiply(yP, xScalar);
++        AffinePoint vPoint = scalarMultiply(yP, w1Scalar);
++        if (zPoint.isInfinity() || vPoint.isInfinity()) {
++            throw new GeneralSecurityException("Invalid SPAKE2+ intermediate point (infinity)");
++        }
++
++        byte[] zOctets = encodeCompressedPoint(zPoint);
++        byte[] vOctets = encodeCompressedPoint(vPoint);
++
++        byte[] transcript = encodeLengthPrefixed(
++                cfg.contextBytes(),
++                cfg.idProverBytes(),
++                cfg.idVerifierBytes(),
++                P256_M_COMPRESSED,
++                P256_N_COMPRESSED,
++                session.shareP,
++                shareV,
++                zOctets,
++                vOctets,
++                reg.w0);
++
++        byte[] kMain = sha256(transcript);
++        byte[] confirmationKeys = hkdfSha256(
++                null,
++                kMain,
++                CONFIRMATION_INFO.getBytes(StandardCharsets.UTF_8),
++                64);
++        byte[] kShared = hkdfSha256(
++                null,
++                kMain,
++                SHARED_KEY_INFO.getBytes(StandardCharsets.UTF_8),
++                32);
++
++        byte[] kcP = Arrays.copyOfRange(confirmationKeys, 0, 32);
++        byte[] kcV = Arrays.copyOfRange(confirmationKeys, 32, 64);
++
++        byte[] confirmVExpected = hmacSha256(kcV, session.shareP);
++        if (!MessageDigest.isEqual(confirmVExpected, confirmV)) {
++            throw new GeneralSecurityException("SPAKE2+ confirmV mismatch");
++        }
++
++        byte[] confirmP = hmacSha256(kcP, shareV);
++
++        Arrays.fill(kMain, (byte) 0);
++        Arrays.fill(confirmationKeys, (byte) 0);
++        Arrays.fill(kcP, (byte) 0);
++        Arrays.fill(kcV, (byte) 0);
++        Arrays.fill(confirmVExpected, (byte) 0);
++
++        return new ProverResult(kShared, confirmP);
++    }
++
++    private static byte[] sha256(byte[] data) {
++        try {
++            MessageDigest md = MessageDigest.getInstance("SHA-256");
++            return md.digest(data);
++        } catch (Exception e) {
++            throw new IllegalStateException("SHA-256 unavailable", e);
++        }
++    }
++
++    private static byte[] hmacSha256(byte[] key, byte[] data) {
++        try {
++            Mac mac = Mac.getInstance(HMAC_SHA256);
++            mac.init(new SecretKeySpec(key, HMAC_SHA256));
++            return mac.doFinal(data);
++        } catch (Exception e) {
++            throw new IllegalStateException("HMAC-SHA256 unavailable", e);
++        }
++    }
++
++    private static AffinePoint negatePoint(AffinePoint point) {
++        if (point == null || point.isInfinity()) {
++            return AffinePoint.infinity();
++        }
++        return new AffinePoint(point.x, modP(P256_FIELD_PRIME.subtract(point.y)));
++    }
++
++    private static AffinePoint subtractPoints(AffinePoint left, AffinePoint right) {
++        return addPoints(left, negatePoint(right));
++    }
++
++    private static byte[] hkdfSha256(byte[] salt, byte[] ikm, byte[] info, int length) {
++        try {
++            Mac mac = Mac.getInstance(HMAC_SHA256);
++            byte[] actualSalt = (salt == null || salt.length == 0) ? new byte[mac.getMacLength()] : salt;
++            mac.init(new SecretKeySpec(actualSalt, HMAC_SHA256));
++            byte[] prk = mac.doFinal(ikm);
++
++            byte[] okm = new byte[length];
++            byte[] previous = new byte[0];
++            int offset = 0;
++            int counter = 1;
++
++            while (offset < length) {
++                mac.init(new SecretKeySpec(prk, HMAC_SHA256));
++                mac.update(previous);
++                if (info != null) {
++                    mac.update(info);
++                }
++                mac.update((byte) counter);
++                byte[] block = mac.doFinal();
++                int remaining = Math.min(block.length, length - offset);
++                System.arraycopy(block, 0, okm, offset, remaining);
++                offset += remaining;
++                previous = block;
++                counter++;
++            }
++
++            Arrays.fill(prk, (byte) 0);
++            Arrays.fill(previous, (byte) 0);
++            return okm;
++        } catch (Exception e) {
++            throw new IllegalStateException("Could not derive SPAKE2+ registration material", e);
++        }
++    }
++
++    private static byte[] encodeLengthPrefixed(byte[]... values) {
++        ByteArrayOutputStream out = new ByteArrayOutputStream();
++        if (values == null) {
++            return out.toByteArray();
++        }
++
++        for (byte[] value : values) {
++            byte[] current = value == null ? new byte[0] : value;
++            writeUint64LE(out, current.length);
++            out.write(current, 0, current.length);
++        }
++
++        return out.toByteArray();
++    }
++
++    private static void writeUint64LE(ByteArrayOutputStream out, int value) {
++        long unsignedValue = value & 0xffffffffL;
++        for (int i = 0; i < 8; i++) {
++            out.write((byte) (unsignedValue & 0xff));
++            unsignedValue >>>= 8;
++        }
++    }
++
++    private static byte[] reduceScalar(byte[] input) {
++        BigInteger scalar = new BigInteger(1, input).mod(P256_ORDER);
++        byte[] raw = scalar.toByteArray();
++        byte[] out = new byte[P256_SCALAR_LENGTH];
++
++        int srcPos = Math.max(0, raw.length - P256_SCALAR_LENGTH);
++        int destPos = Math.max(0, P256_SCALAR_LENGTH - raw.length);
++        int len = Math.min(P256_SCALAR_LENGTH, raw.length);
++
++        System.arraycopy(raw, srcPos, out, destPos, len);
++        Arrays.fill(raw, (byte) 0);
++        return out;
++    }
++
++    private static byte[] generateEphemeralScalar() {
++        byte[] candidate = new byte[P256_SCALAR_LENGTH];
++        BigInteger scalar;
++
++        do {
++            RNG.nextBytes(candidate);
++            scalar = new BigInteger(1, candidate);
++        } while (scalar.signum() == 0 || scalar.compareTo(P256_ORDER) >= 0);
++
++        return candidate;
++    }
++
++    private static AffinePoint scalarMultiply(AffinePoint point, BigInteger scalar) {
++        if (point == null || point.isInfinity()) {
++            return AffinePoint.infinity();
++        }
++        if (scalar == null || scalar.signum() == 0) {
++            return AffinePoint.infinity();
++        }
++
++        AffinePoint result = AffinePoint.infinity();
++        AffinePoint addend = point;
++
++        for (int i = scalar.bitLength() - 1; i >= 0; i--) {
++            result = doublePoint(result);
++            if (scalar.testBit(i)) {
++                result = addPoints(result, addend);
++            }
++        }
++
++        return result;
++    }
++
++    private static AffinePoint addPoints(AffinePoint left, AffinePoint right) {
++        if (left == null || left.isInfinity()) {
++            return right;
++        }
++        if (right == null || right.isInfinity()) {
++            return left;
++        }
++
++        if (left.x.equals(right.x)) {
++            if (modP(left.y.add(right.y)).equals(BigInteger.ZERO)) {
++                return AffinePoint.infinity();
++            }
++            return doublePoint(left);
++        }
++
++        BigInteger lambda = modP(right.y.subtract(left.y))
++                .multiply(modP(right.x.subtract(left.x)).modInverse(P256_FIELD_PRIME))
++                .mod(P256_FIELD_PRIME);
++        BigInteger x3 = modP(lambda.multiply(lambda).subtract(left.x).subtract(right.x));
++        BigInteger y3 = modP(lambda.multiply(left.x.subtract(x3)).subtract(left.y));
++        return new AffinePoint(x3, y3);
++    }
++
++    private static AffinePoint doublePoint(AffinePoint point) {
++        if (point == null || point.isInfinity()) {
++            return AffinePoint.infinity();
++        }
++        if (point.y.signum() == 0) {
++            return AffinePoint.infinity();
++        }
++
++        BigInteger numerator = point.x.multiply(point.x).multiply(BigInteger.valueOf(3)).add(P256_A);
++        BigInteger denominator = point.y.shiftLeft(1).modInverse(P256_FIELD_PRIME);
++        BigInteger lambda = modP(numerator.multiply(denominator));
++        BigInteger x3 = modP(lambda.multiply(lambda).subtract(point.x.shiftLeft(1)));
++        BigInteger y3 = modP(lambda.multiply(point.x.subtract(x3)).subtract(point.y));
++        return new AffinePoint(x3, y3);
++    }
++
++    private static byte[] encodeCompressedPoint(AffinePoint point) {
++        if (point == null || point.isInfinity()) {
++            throw new IllegalArgumentException("Cannot encode point at infinity");
++        }
++
++        byte[] x = toFixedLength(point.x, P256_SCALAR_LENGTH);
++        byte[] encoded = new byte[P256_COMPRESSED_POINT_LENGTH];
++        encoded[0] = point.y.testBit(0) ? (byte) 0x03 : (byte) 0x02;
++        System.arraycopy(x, 0, encoded, 1, x.length);
++        Arrays.fill(x, (byte) 0);
++        return encoded;
++    }
++
++    private static AffinePoint decodeCompressedPoint(byte[] encoded) {
++        if (encoded == null || encoded.length != P256_COMPRESSED_POINT_LENGTH) {
++            throw new IllegalArgumentException("Invalid compressed P-256 point");
++        }
++        if (encoded[0] != 0x02 && encoded[0] != 0x03) {
++            throw new IllegalArgumentException("Unsupported compressed point format");
++        }
++
++        byte[] xBytes = Arrays.copyOfRange(encoded, 1, encoded.length);
++        BigInteger x = new BigInteger(1, xBytes);
++        BigInteger rhs = modP(x.multiply(x).multiply(x)
++                .add(P256_A.multiply(x))
++                .add(P256_B));
++        BigInteger y = rhs.modPow(P256_FIELD_PRIME.add(BigInteger.ONE).shiftRight(2), P256_FIELD_PRIME);
++
++        if (!modP(y.multiply(y)).equals(rhs)) {
++            throw new IllegalArgumentException("Compressed point is not on P-256");
++        }
++        if ((encoded[0] == 0x03) != y.testBit(0)) {
++            y = P256_FIELD_PRIME.subtract(y);
++        }
++
++        Arrays.fill(xBytes, (byte) 0);
++        return new AffinePoint(x, y);
++    }
++
++    private static BigInteger modP(BigInteger value) {
++        BigInteger reduced = value.mod(P256_FIELD_PRIME);
++        if (reduced.signum() < 0) {
++            return reduced.add(P256_FIELD_PRIME);
++        }
++        return reduced;
++    }
++
++    private static byte[] toFixedLength(BigInteger value, int length) {
++        byte[] raw = value.toByteArray();
++        byte[] out = new byte[length];
++
++        int srcPos = Math.max(0, raw.length - length);
++        int destPos = Math.max(0, length - raw.length);
++        int copyLen = Math.min(length, raw.length);
++
++        System.arraycopy(raw, srcPos, out, destPos, copyLen);
++        Arrays.fill(raw, (byte) 0);
++        return out;
++    }
++
++    static final class ProverConfig {
++        final String ciphersuite;
++        final String context;
++        final String idProver;
++        final String idVerifier;
++
++        private ProverConfig(String ciphersuite, String context, String idProver, String idVerifier) {
++            this.ciphersuite = ciphersuite;
++            this.context = context;
++            this.idProver = idProver;
++            this.idVerifier = idVerifier;
++        }
++
++        byte[] contextBytes() {
++            return context.getBytes(StandardCharsets.UTF_8);
++        }
++
++        byte[] ciphersuiteBytes() {
++            return ciphersuite.getBytes(StandardCharsets.UTF_8);
++        }
++
++        byte[] idProverBytes() {
++            return idProver.getBytes(StandardCharsets.UTF_8);
++        }
++
++        byte[] idVerifierBytes() {
++            return idVerifier.getBytes(StandardCharsets.UTF_8);
++        }
++    }
++
++    static final class ProverRegistration {
++        final ProverConfig config;
++        final byte[] w0;
++        final byte[] w1;
++
++        private ProverRegistration(ProverConfig config, byte[] w0, byte[] w1) {
++            this.config = config;
++            this.w0 = w0;
++            this.w1 = w1;
++        }
++    }
++
++    static final class ProverSession {
++        final ProverRegistration registration;
++        final byte[] x;
++        final byte[] shareP;
++
++        private ProverSession(ProverRegistration registration, byte[] x, byte[] shareP) {
++            this.registration = registration;
++            this.x = x;
++            this.shareP = shareP;
++        }
++    }
++
++    static final class ProverResult {
++        final byte[] sharedKey;
++        final byte[] confirmP;
++
++        private ProverResult(byte[] sharedKey, byte[] confirmP) {
++            this.sharedKey = sharedKey;
++            this.confirmP = confirmP;
++        }
++    }
++
++    private static final class AffinePoint {
++        private static final AffinePoint INFINITY = new AffinePoint(null, null);
++
++        final BigInteger x;
++        final BigInteger y;
++
++        private AffinePoint(BigInteger x, BigInteger y) {
++            this.x = x;
++            this.y = y;
++        }
++
++        static AffinePoint infinity() {
++            return INFINITY;
++        }
++
++        boolean isInfinity() {
++            return x == null || y == null;
++        }
++    }
++}
+diff --git a/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/VPCDWorker.java b/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/VPCDWorker.java
+index a45478a..03daf7d 100644
+--- a/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/VPCDWorker.java
++++ b/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/VPCDWorker.java
+@@ -19,7 +19,11 @@
+ 
+ package com.vsmartcard.remotesmartcardreader.app;
+ 
++import android.content.Context;
++import android.content.SharedPreferences;
+ import android.os.AsyncTask;
++import android.preference.PreferenceManager;
++import android.util.Base64;
+ 
+ import androidx.annotation.Nullable;
+ 
+@@ -35,28 +39,46 @@ import java.net.NetworkInterface;
+ import java.net.ServerSocket;
+ import java.net.Socket;
+ import java.net.SocketTimeoutException;
++import java.net.UnknownHostException;
++import java.nio.charset.StandardCharsets;
++import java.security.GeneralSecurityException;
++import java.security.MessageDigest;
++import java.security.SecureRandom;
++import java.util.ArrayDeque;
++import java.util.Arrays;
+ import java.util.Enumeration;
++import java.util.HashMap;
+ import java.util.LinkedList;
+ import java.util.List;
++import java.util.Map;
++
++import javax.crypto.Cipher;
++import javax.crypto.spec.GCMParameterSpec;
++import javax.crypto.spec.SecretKeySpec;
+ 
+ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
+ 
++    private static final int GCM_NONCE_LEN = 12;
++    private static final int GCM_TAG_LEN = 16;
++    private static final int PADDED_FRAME_PLAIN_LEN = 2048;
++
+     public static class VPCDWorkerParams {
+         final String hostname;
+         final int port;
+         final SCReader reader;
+         final boolean listen;
+-        VPCDWorkerParams(String hostname, int port, SCReader reader, boolean listen) {
++        final Context context;
++        VPCDWorkerParams(String hostname, int port, SCReader reader, boolean listen, Context context) {
+             this.hostname = hostname;
+             this.port = port;
+             this.reader = reader;
+             this.listen = listen;
++            this.context = context;
+         }
+     }
+ 
+-    public static final int DEFAULT_PORT = 35963;
+-    // default URI when used in emulator
+-    public static final String DEFAULT_HOSTNAME = "10.0.2.2";
++    public static final int DEFAULT_PORT = 5060;
++    public static final String DEFAULT_HOSTNAME = "middlepoint.test";
+     public static final boolean DEFAULT_LISTEN = false;
+ 
+     private SCReader reader;
+@@ -64,6 +86,22 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
+     private Socket socket;
+     private InputStream inputStream;
+     private OutputStream outputStream;
++    private byte[] sharedSecret;
++    private boolean secureMode = false;
++
++    // Per-direction chaining state to prevent replay/out-of-order frames.
++    // The plaintext is prefixed with the previous frame's GCM tag.
++    private final byte[] sendChainTag = new byte[GCM_TAG_LEN];
++    private final byte[] recvChainTag = new byte[GCM_TAG_LEN];
++    private String pairingId;
++    private String deviceId;
++    private String qrSecret;
++    private String ip;
++    private String port;
++    private Spake2Plus.ProverConfig spake2PlusConfig;
++    private Spake2Plus.ProverSession spake2PlusSession;
++    private Context appContext;
++    private final ArrayDeque<String> bufferedJsonLines = new ArrayDeque<>();
+ 
+     @Override
+     protected void onCancelled () {
+@@ -86,11 +124,13 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
+     public Void doInBackground(VPCDWorkerParams... params) {
+         try {
+             reader = params[0].reader;
++            appContext = params[0].context != null ? params[0].context.getApplicationContext() : null;
+             vpcdConnection(params[0]);
+ 
+             while (!isCancelled()) {
+                 vpcdAccept();
+                 byte[] out = null;
++                boolean disconnectAfterSend = false;
+                 byte[] in = receiveFromVPCD();
+                 if (in == null) {
+                     if (listenSocket == null) {
+@@ -111,7 +151,12 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
+                             break;
+                         case VPCD_CTRL_ON:
+                             reader.powerOn();
+-                            Log.i(this.getClass().getName(), "Powered up the card with ATR " + Hex.getHexString(reader.getATR()));
++                            byte[] atrOn = reader.getATR();
++                            if (atrOn != null) {
++                                Log.i(this.getClass().getName(), "Powered up the card with ATR " + Hex.getHexString(atrOn));
++                            } else {
++                                Log.i(this.getClass().getName(), "Powered up the card (ATR unavailable)");
++                            }
+                             break;
+                         case VPCD_CTRL_RESET:
+                             reader.reset();
+@@ -119,18 +164,35 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
+                             break;
+                         case VPCD_CTRL_ATR:
+                             out = reader.getATR();
++                            if (out == null) {
++                                // Tag removed: reply with an empty frame so vpcd/pcscd won't block,
++                                // then disconnect to transition to 'no card'.
++                                out = new byte[0];
++                                disconnectAfterSend = true;
++                            }
+                             break;
+                         default:
+                             throw new IOException("Unhandled command from VPCD.");
+                     }
+                 } else {
+                     Log.i(this.getClass().getName(), "C-APDU: " + Hex.getHexString(in));
+-                    out = reader.transmit(in);
+-                    Log.i(this.getClass().getName(), "R-APDU: " + Hex.getHexString(out));
++                    try {
++                        out = reader.transmit(in);
++                        Log.i(this.getClass().getName(), "R-APDU: " + Hex.getHexString(out));
++                    } catch (IOException e) {
++                        // Most commonly TagLostException: card removed during APDU.
++                        Log.i(this.getClass().getName(), "Card I/O failed (card removed?): " + e.getMessage());
++                        out = new byte[0];
++                        disconnectAfterSend = true;
++                    }
+                 }
+                 if (out != null) {
+                     sendToVPCD(out);
+                 }
++
++                if (disconnectAfterSend) {
++                    break;
++                }
+             }
+         } catch (Exception e) {
+             if (!isCancelled()) {
+@@ -148,6 +210,16 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
+ 
+     @Nullable
+     private byte[] receiveFromVPCD() throws IOException {
++        if (secureMode) {
++            try {
++                return receiveEncryptedFrame();
++            } catch (Exception e) {
++                throw new IOException("Failed to receive encrypted frame: " + e.getMessage(), e);
++            }
++        }
++        if (listenSocket == null) {
++            throw new IOException("Secure channel not established yet");
++        }
+         /* convert length from network byte order.
+         Note that Java always uses network byte order internally. */
+         int length1 = inputStream.read();
+@@ -175,6 +247,17 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
+     }
+ 
+     private void sendToVPCD(byte[] data) throws IOException {
++        if (secureMode) {
++            try {
++                sendEncryptedFrame(data);
++                return;
++            } catch (Exception e) {
++                throw new IOException("Failed to send encrypted frame: " + e.getMessage(), e);
++            }
++        }
++        if (listenSocket == null) {
++            throw new IOException("Secure channel not established yet");
++        }
+         /* convert length to network byte order.
+         Note that Java always uses network byte order internally. */
+         byte[] packet = new byte[2 + data.length];
+@@ -192,9 +275,174 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
+             return;
+         }
+ 
+-        Log.i(this.getClass().getName(), "Connecting to " + params.hostname + ":" + params.port + "...");
+-        vpcdConnect(params.hostname, params.port);
+-        Log.i(this.getClass().getName(), "Connected to VPCD");
++        loadConfigFromPrefs();
++        try {
++            CryptoUtils.ensureConscrypt();
++            Spake2Plus.ProverRegistration spake2PlusRegistration =
++                    Spake2Plus.deriveProverRegistration(CryptoUtils.hexToBytes(qrSecret), spake2PlusConfig);
++            spake2PlusSession = Spake2Plus.beginProverSession(spake2PlusRegistration);
++
++            Log.i(this.getClass().getName(), "Connecting to " + params.hostname + ":" + params.port + "...");
++            vpcdConnect(params.hostname, params.port);
++            Log.i(this.getClass().getName(), "Connected to middlepoint");
++
++            performHandshake();
++
++            restoreSharedSecretIfAvailable();
++            if (!isPairingConfirmed() || sharedSecret == null) {
++                completeSpake2PlusPairing();
++            }
++
++            secureMode = sharedSecret != null;
++            if (!secureMode) {
++                throw new IOException("Secure channel could not be established");
++            }
++
++            // Reset chaining state on (re)connect.
++            Arrays.fill(sendChainTag, (byte) 0);
++            Arrays.fill(recvChainTag, (byte) 0);
++
++            Log.i(this.getClass().getName(), "Secure channel established");
++        } catch (Exception e) {
++            throw new IOException("Could not initialize secure channel: " + e.getMessage(), e);
++        }
++    }
++
++    private void restoreSharedSecretIfAvailable() {
++        if (appContext == null) {
++            return;
++        }
++        try {
++            if (!isPairingConfirmed()) {
++                return;
++            }
++            byte[] stored = CryptoUtils.loadSharedSecret(appContext);
++            if (stored != null && stored.length == 32) {
++                sharedSecret = stored;
++            }
++        } catch (Exception e) {
++            Log.w(this.getClass().getName(), "Could not restore shared secret, will re-pair: " + e.getMessage());
++            sharedSecret = null;
++        }
++    }
++
++    private void completeSpake2PlusPairing() throws Exception {
++        if (spake2PlusSession == null) {
++            throw new IllegalStateException("SPAKE2+ session not initialized");
++        }
++
++        setPairingConfirmed(false);
++        sendPairingMessage(spake2PlusSession.shareP);
++        Log.i(this.getClass().getName(), "Waiting for SPAKE2+ shareV/confirmV...");
++
++        byte[] shareV = null;
++        byte[] confirmV = null;
++
++        while (true) {
++            PayloadMessage msg = waitForPayloadMessage();
++            if (msg == null || msg.payload == null) {
++                continue;
++            }
++            Map<String, String> kv = parseKvPayload(msg.payload);
++            String shareVHex = kv.get("shareV");
++            String confirmVHex = kv.get("confirmV");
++            if (shareVHex == null || confirmVHex == null) {
++                continue;
++            }
++            shareV = CryptoUtils.hexToBytes(shareVHex);
++            confirmV = CryptoUtils.hexToBytes(confirmVHex);
++            break;
++        }
++
++        Spake2Plus.ProverResult result = Spake2Plus.finishProverSession(spake2PlusSession, shareV, confirmV);
++        sharedSecret = result.sharedKey;
++
++        sendPairingConfirmation(result.confirmP);
++        if (appContext != null) {
++            CryptoUtils.storeSharedSecret(appContext, sharedSecret);
++        }
++        setPairingConfirmed(true);
++
++        Arrays.fill(shareV, (byte) 0);
++        Arrays.fill(confirmV, (byte) 0);
++
++        Log.i(this.getClass().getName(), "SPAKE2+ pairing completed; shared secret derived");
++    }
++
++    private void sendPairingConfirmation(byte[] confirmP) throws Exception {
++        if (confirmP == null || confirmP.length == 0) {
++            throw new IllegalArgumentException("Missing SPAKE2+ confirmP");
++        }
++        String payload = "confirmP=" + CryptoUtils.bytesToHex(confirmP);
++        String msg = String.format(
++                "{\"message_type\":\"communication\",\"source_id\":\"%s\",\"payload\":\"%s\"}",
++                deviceId,
++                payload);
++        sendJsonLine(msg);
++        waitForStatusOk();
++    }
++
++    private static Map<String, String> parseKvPayload(String payload) {
++        Map<String, String> out = new HashMap<>();
++        if (payload == null || payload.isEmpty()) {
++            return out;
++        }
++
++        String[] parts = payload.split("&");
++        for (String part : parts) {
++            if (part == null || part.isEmpty()) {
++                continue;
++            }
++            int idx = part.indexOf('=');
++            if (idx <= 0) {
++                continue;
++            }
++            String key = part.substring(0, idx);
++            String value = part.substring(idx + 1);
++            if (!key.isEmpty()) {
++                out.put(key, value);
++            }
++        }
++        return out;
++    }
++
++    private static final class PayloadMessage {
++        final String sourceId;
++        final String payload;
++
++        private PayloadMessage(String sourceId, String payload) {
++            this.sourceId = sourceId;
++            this.payload = payload;
++        }
++    }
++
++    private PayloadMessage waitForPayloadMessage() throws IOException {
++        while (true) {
++            String line = readJsonLine();
++            if (line == null) {
++                throw new IOException("Connection closed while waiting for payload");
++            }
++            if (line.isEmpty()) {
++                continue;
++            }
++            try {
++                org.json.JSONObject obj = new org.json.JSONObject(line);
++                if (obj.has("status_code")) {
++                    int code = obj.getInt("status_code");
++                    if (code != 200) {
++                        String payload = obj.optString("payload", "");
++                        throw new IOException("Received status " + code + (payload.isEmpty() ? "" : (" payload=" + payload)));
++                    }
++                    continue;
++                }
++                if (!obj.has("payload")) {
++                    continue;
++                }
++                String payload = obj.getString("payload");
++                String sourceId = obj.optString("source_id", "");
++                return new PayloadMessage(sourceId, payload);
++            } catch (org.json.JSONException ignored) { }
++        }
+     }
+ 
+     private void vpcdListen(int port) throws IOException {
+@@ -260,12 +508,22 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
+ 
+     private void vpcdConnect(String hostname, int port) throws IOException {
+         listenSocket = null;
+-        socket = new Socket(InetAddress.getByName(hostname), port);
++        InetAddress address = resolveAddress(hostname);
++        Log.i(this.getClass().getName(), "Resolved " + hostname + " to " + address.getHostAddress());
++        socket = new Socket(address, port);
+         socket.setTcpNoDelay(true);
+         outputStream = socket.getOutputStream();
+         inputStream = socket.getInputStream();
+     }
+ 
++    static InetAddress resolveAddress(String hostname) throws IOException {
++        try {
++            return InetAddress.getByName(hostname);
++        } catch (UnknownHostException e) {
++            throw new IOException("Could not resolve hostname '" + hostname + "'. Use a reachable IP or fix DNS.", e);
++        }
++    }
++
+     private void vpcdDisconnect() throws IOException {
+         if (reader != null) {
+             reader.eject();
+@@ -280,6 +538,237 @@ class VPCDWorker extends AsyncTask<VPCDWorker.VPCDWorkerParams, Void, Void> {
+         }
+     }
+ 
++    private void loadConfigFromPrefs() throws IOException {
++        if (appContext == null) {
++            throw new IOException("Application context unavailable");
++        }
++        SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(appContext);
++        pairingId = sp.getString("pairing_id", null);
++        deviceId = sp.getString("device_id", null);
++        qrSecret = sp.getString("qr_secret", null);
++        
++        ip = sp.getString("ip", null);
++        port = sp.getString("port", null);
++        
++        if (ip != null && !ip.isEmpty()) {
++            Log.i(this.getClass().getName(), "Using host from QR: " + ip);
++        }
++        if (port != null && !port.isEmpty()) {
++            Log.i(this.getClass().getName(), "Using port from QR: " + port);
++        }
++        
++        if (pairingId == null || pairingId.isEmpty()
++                || deviceId == null || deviceId.isEmpty()
++                || qrSecret == null || qrSecret.isEmpty()) {
++            throw new IOException("Missing pairing configuration, scan QR again.");
++        }
++        try {
++            spake2PlusConfig = Spake2Plus.buildProverConfig(deviceId, pairingId);
++        } catch (IllegalArgumentException e) {
++            throw new IOException("Invalid SPAKE2+ configuration: " + e.getMessage(), e);
++        }
++    }
++
++    private boolean isPairingConfirmed() throws IOException {
++        if (appContext == null) {
++            throw new IOException("Application context unavailable");
++        }
++        SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(appContext);
++        return sp.getBoolean("pairing_confirmed", true);
++    }
++
++    private void setPairingConfirmed(boolean confirmed) throws IOException {
++        if (appContext == null) {
++            throw new IOException("Application context unavailable");
++        }
++        SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(appContext);
++        if (!sp.edit().putBoolean("pairing_confirmed", confirmed).commit()) {
++            throw new IOException("Could not persist pairing state");
++        }
++    }
++
++    private void performHandshake() throws IOException, GeneralSecurityException {
++        String msg = String.format("{\"message_type\":\"handshake\",\"pairing_id\":\"%s\",\"device_id\":\"%s\",\"role\":\"app\"}", pairingId, deviceId);
++        sendJsonLine(msg);
++        waitForStatusOk();
++    }
++
++    private void sendPairingMessage(byte[] shareP) throws Exception {
++        if (shareP == null || shareP.length == 0) {
++            throw new IllegalArgumentException("Missing SPAKE2+ shareP");
++        }
++        String payload = "shareP=" + CryptoUtils.bytesToHex(shareP);
++        String msg = String.format("{\"message_type\":\"communication\",\"source_id\":\"%s\",\"payload\":\"%s\"}", deviceId, payload);
++        sendJsonLine(msg);
++        waitForStatusOk();
++    }
++
++    private void sendJsonLine(String json) throws IOException {
++        byte[] bytes = (json + "\n").getBytes(StandardCharsets.UTF_8);
++        outputStream.write(bytes);
++        outputStream.flush();
++    }
++
++    private String readJsonLine() throws IOException {
++        if (!bufferedJsonLines.isEmpty()) {
++            return bufferedJsonLines.removeFirst();
++        }
++        return readJsonLineFromStream();
++    }
++
++    private String readJsonLineFromStream() throws IOException {
++        StringBuilder sb = new StringBuilder();
++        int ch;
++        while ((ch = inputStream.read()) != -1) {
++            if (ch == '\n') {
++                break;
++            }
++            sb.append((char) ch);
++        }
++        if (sb.length() == 0 && ch == -1) {
++            return null;
++        }
++        return sb.toString().trim();
++    }
++
++    private void waitForStatusOk() throws IOException {
++        while (true) {
++            String line = readJsonLineFromStream();
++            if (line == null) {
++                throw new IOException("Connection closed while waiting for status");
++            }
++            if (line.isEmpty()) {
++                continue;
++            }
++            try {
++                org.json.JSONObject obj = new org.json.JSONObject(line);
++                if (obj.has("status_code")) {
++                    int code = obj.getInt("status_code");
++                    if (code != 200) {
++                        String payload = obj.optString("payload", "");
++                        throw new IOException("Server returned status " + code + (payload.isEmpty() ? "" : (" payload=" + payload)));
++                    }
++                    return;
++                }
++                bufferedJsonLines.addLast(line);
++            } catch (org.json.JSONException ignored) { }
++        }
++    }
++
++    private byte[] receiveEncryptedFrame() throws Exception {
++        while (true) {
++            String line = readJsonLine();
++            if (line == null) {
++                return null;
++            }
++            if (line.isEmpty()) {
++                continue;
++            }
++            try {
++                org.json.JSONObject obj = new org.json.JSONObject(line);
++                if (obj.has("status_code")) {
++                    int code = obj.getInt("status_code");
++                    if (code != 200) {
++                        throw new IOException("Received status " + code);
++                    }
++                    continue;
++                }
++                if (!obj.has("payload")) {
++                    continue;
++                }
++                String payload = obj.getString("payload");
++                byte[] plain = decryptPayload(payload);
++                if (plain == null || plain.length < 2) {
++                    throw new IOException("Invalid decrypted frame");
++                }
++                int length = ((plain[0] & 0xff) << 8) | (plain[1] & 0xff);
++                if (length > plain.length - 2) {
++                    throw new IOException("Frame length mismatch");
++                }
++                byte[] out = new byte[length];
++                System.arraycopy(plain, 2, out, 0, length);
++                return out;
++            } catch (org.json.JSONException ignored) { }
++        }
++    }
++
++    private void sendEncryptedFrame(byte[] data) throws Exception {
++        if (sharedSecret == null) {
++            throw new IllegalStateException("Shared secret not established");
++        }
++
++        if (data.length > PADDED_FRAME_PLAIN_LEN - 2) {
++            throw new IOException("Frame too large");
++        }
++
++        byte[] plain = new byte[PADDED_FRAME_PLAIN_LEN];
++        plain[0] = (byte) (data.length >> 8);
++        plain[1] = (byte) (data.length & 0xff);
++        System.arraycopy(data, 0, plain, 2, data.length);
++
++        String payload = encryptPayload(plain);
++        String msg = String.format("{\"message_type\":\"communication\",\"source_id\":\"%s\",\"payload\":\"%s\"}", deviceId, payload);
++        sendJsonLine(msg);
++        waitForStatusOk();
++    }
++
++    private String encryptPayload(byte[] plain) throws Exception {
++        byte[] chainedPlain = new byte[GCM_TAG_LEN + plain.length];
++        System.arraycopy(sendChainTag, 0, chainedPlain, 0, GCM_TAG_LEN);
++        System.arraycopy(plain, 0, chainedPlain, GCM_TAG_LEN, plain.length);
++
++        byte[] nonce = new byte[GCM_NONCE_LEN];
++        new SecureRandom().nextBytes(nonce);
++        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
++        GCMParameterSpec spec = new GCMParameterSpec(128, nonce);
++        SecretKeySpec keySpec = new SecretKeySpec(sharedSecret, "AES");
++        cipher.init(Cipher.ENCRYPT_MODE, keySpec, spec);
++
++        byte[] ct = cipher.doFinal(chainedPlain);
++
++        if (ct.length < GCM_TAG_LEN) {
++            throw new IOException("Ciphertext too short");
++        }
++        System.arraycopy(ct, ct.length - GCM_TAG_LEN, sendChainTag, 0, GCM_TAG_LEN);
++
++        byte[] blob = new byte[nonce.length + ct.length];
++        System.arraycopy(nonce, 0, blob, 0, nonce.length);
++        System.arraycopy(ct, 0, blob, nonce.length, ct.length);
++        return Base64.encodeToString(blob, Base64.NO_WRAP);
++    }
++
++    private byte[] decryptPayload(String payload) throws Exception {
++        byte[] blob = Base64.decode(payload, Base64.DEFAULT);
++        if (blob.length < GCM_NONCE_LEN + GCM_TAG_LEN) {
++            throw new IOException("Ciphertext too short");
++        }
++        byte[] nonce = Arrays.copyOfRange(blob, 0, GCM_NONCE_LEN);
++        byte[] ct = Arrays.copyOfRange(blob, GCM_NONCE_LEN, blob.length);
++
++        if (ct.length < GCM_TAG_LEN) {
++            throw new IOException("Ciphertext too short");
++        }
++        byte[] receivedTag = Arrays.copyOfRange(ct, ct.length - GCM_TAG_LEN, ct.length);
++
++        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
++        GCMParameterSpec spec = new GCMParameterSpec(128, nonce);
++        SecretKeySpec keySpec = new SecretKeySpec(sharedSecret, "AES");
++        cipher.init(Cipher.DECRYPT_MODE, keySpec, spec);
++
++        byte[] chainedPlain = cipher.doFinal(ct);
++        if (chainedPlain.length < GCM_TAG_LEN + 2) {
++            throw new IOException("Invalid decrypted frame");
++        }
++
++        byte[] prev = Arrays.copyOfRange(chainedPlain, 0, GCM_TAG_LEN);
++        if (!MessageDigest.isEqual(prev, recvChainTag)) {
++            throw new IOException("Chaining check failed (replay/out-of-order)");
++        }
++
++        System.arraycopy(receivedTag, 0, recvChainTag, 0, GCM_TAG_LEN);
++        return Arrays.copyOfRange(chainedPlain, GCM_TAG_LEN, chainedPlain.length);
++    }
++
+     /**
+      * Usage of API level 24+ would allow streams(), join can be removed.
+      */
+diff --git a/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/screaders/NFCReader.java b/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/screaders/NFCReader.java
+index 881d393..5fded89 100644
+--- a/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/screaders/NFCReader.java
++++ b/remote-reader/app/src/main/java/com/vsmartcard/remotesmartcardreader/app/screaders/NFCReader.java
+@@ -110,6 +110,20 @@ public class NFCReader implements SCReader {
+     /* generate the mapped ATR from 14443 data according to PC/SC part 3 section 3.1.3.2.3 */
+     @Override
+     public byte[] getATR() {
++        // IMPORTANT:
++        // pcscd/ifd-vpcd uses ATR requests as a card presence check.
++        // IsoDep.getHistoricalBytes() may still be available even after tag removal,
++        // so we must trigger a real RF exchange to detect TagLost.
++        try {
++            card.transceive(PRESENCE_PROBE_APDU);
++        } catch (IOException e) {
++            Log.i(this.getClass().getName(), "Tag lost while reading ATR: " + e.getMessage());
++            try {
++                eject();
++            } catch (IOException ignored) { }
++            return null;
++        }
++
+         // for 14443 Type A, use the historical bytes returned as part of the ATS
+         byte[] historicalBytes = card.getHistoricalBytes();
+         if (historicalBytes == null) {
+@@ -138,6 +152,10 @@ public class NFCReader implements SCReader {
+         return atr;
+     }
+ 
++    // Minimal APDU to force an RF exchange; if the card is removed, this will throw
++    // (TagLostException extends IOException).
++    private static final byte[] PRESENCE_PROBE_APDU = {(byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x00};
++
+     @Override
+     public byte[] transmit(byte[] apdu) throws IOException {
+         return card.transceive(apdu);
+diff --git a/remote-reader/app/src/main/res/xml/settings.xml b/remote-reader/app/src/main/res/xml/settings.xml
+index 5d72274..183c2d6 100644
+--- a/remote-reader/app/src/main/res/xml/settings.xml
++++ b/remote-reader/app/src/main/res/xml/settings.xml
+@@ -14,23 +14,23 @@
+ 
+         <Preference
+             android:title="Scan Configuration"
+-            android:summary="Scan QR code from vpcd-config to import VPCD's hostname and port."
++            android:summary="Scan QR code from vpcd-config to import the pairing configuration."
+             android:key="scan">
+         </Preference>
+ 
+         <EditTextPreference
+-            android:key="hostname"
+-            android:defaultValue="10.0.2.2"
+-            android:title="@string/hint_vpcd_hostname"
++            android:key="ip"
++            android:defaultValue="middlepoint.test"
++            android:title="DNS name"
+             android:hint="URL or IP address"
+             android:inputType="textUri" />
+ 
+         <EditTextPreference
+             android:key="port"
+-            android:defaultValue="35963"
+-            android:title="@string/hint_vpcd_port"
++            android:defaultValue="5060"
++            android:title="DNS port"
+             android:inputType="number"
+-            android:hint="Default: 35963" />
++            android:hint="Default: 5060" />
+ 
+         <CheckBoxPreference
+             android:key="listen"
+@@ -38,6 +38,21 @@
+             android:title="@string/hint_vpcd_listen"
+             android:hint="Default: false" />
+ 
++        <Preference
++            android:key="pairing_id"
++            android:title="Pairing ID"
++            android:summary="XXXXXXXXXXXXXXX" />
++
++        <Preference
++            android:key="device_id"
++            android:title="Device ID"
++            android:summary="XXXXXXXXXXXXXXX" />
++
++        <Preference
++        android:key="qr_secret"
++        android:title="QR Secret"
++        android:summary="XXXXXXXXXXXXXXX" />
++
+     </PreferenceCategory>
+ 
+     <PreferenceCategory
+@@ -65,4 +80,4 @@
+ 
+     </PreferenceCategory>
+ 
+-</PreferenceScreen>
+\ No newline at end of file
++</PreferenceScreen>
+diff --git a/virtualsmartcard/config.h b/virtualsmartcard/config.h
+new file mode 100644
+index 0000000..36c2019
+--- /dev/null
++++ b/virtualsmartcard/config.h
+@@ -0,0 +1,148 @@
++/* config.h.  Generated from config.h.in by configure.  */
++/* config.h.in.  Generated from configure.ac by autoheader.  */
++
++/* Define to 1 if you have the <arpa/inet.h> header file. */
++#define HAVE_ARPA_INET_H 1
++
++/* Define to 1 if you have the <debuglog.h> header file. */
++#define HAVE_DEBUGLOG_H 1
++
++/* Define to 1 if you have the declaration of `inet_ntop', and to 0 if you
++   don't. */
++#define HAVE_DECL_INET_NTOP 1
++
++/* Define to 1 if you have the declaration of `MSG_NOSIGNAL', and to 0 if you
++   don't. */
++#define HAVE_DECL_MSG_NOSIGNAL 1
++
++/* Define to 1 if you have the declaration of `SO_NOSIGPIPE', and to 0 if you
++   don't. */
++#define HAVE_DECL_SO_NOSIGPIPE 0
++
++/* Define to 1 if you have the <dlfcn.h> header file. */
++#define HAVE_DLFCN_H 1
++
++/* Define to 1 if you have the <ifdhandler.h> header file. */
++#define HAVE_IFDHANDLER_H 1
++
++/* Define to 1 if you have the <inttypes.h> header file. */
++#define HAVE_INTTYPES_H 1
++
++/* Define to 1 if your system has a GNU libc compatible `malloc' function, and
++   to 0 otherwise. */
++#define HAVE_MALLOC 1
++
++/* Define to 1 if you have the `memset' function. */
++#define HAVE_MEMSET 1
++
++/* Define if you have POSIX threads libraries and header files. */
++#define HAVE_PTHREAD 1
++
++/* Have PTHREAD_PRIO_INHERIT. */
++#define HAVE_PTHREAD_PRIO_INHERIT 1
++
++/* enable QR support */
++#define HAVE_QRENCODE 1
++
++/* Define to 1 if you have the <qrencode.h> header file. */
++#define HAVE_QRENCODE_H 1
++
++/* Define to 1 if you have the `select' function. */
++#define HAVE_SELECT 1
++
++/* Define to 1 if you have the `socket' function. */
++#define HAVE_SOCKET 1
++
++/* Define to 1 if you have the <stdint.h> header file. */
++#define HAVE_STDINT_H 1
++
++/* Define to 1 if you have the <stdio.h> header file. */
++#define HAVE_STDIO_H 1
++
++/* Define to 1 if you have the <stdlib.h> header file. */
++#define HAVE_STDLIB_H 1
++
++/* Define to 1 if you have the <strings.h> header file. */
++#define HAVE_STRINGS_H 1
++
++/* Define to 1 if you have the <string.h> header file. */
++#define HAVE_STRING_H 1
++
++/* Define to 1 if you have the `strlcat' function. */
++#define HAVE_STRLCAT 1
++
++/* Define to 1 if you have the `strlcpy' function. */
++#define HAVE_STRLCPY 1
++
++/* Define to 1 if you have the <syslog.h> header file. */
++#define HAVE_SYSLOG_H 1
++
++/* Define to 1 if you have the <sys/socket.h> header file. */
++#define HAVE_SYS_SOCKET_H 1
++
++/* Define to 1 if you have the <sys/stat.h> header file. */
++#define HAVE_SYS_STAT_H 1
++
++/* Define to 1 if you have the <sys/time.h> header file. */
++#define HAVE_SYS_TIME_H 1
++
++/* Define to 1 if you have the <sys/types.h> header file. */
++#define HAVE_SYS_TYPES_H 1
++
++/* Define to 1 if you have the <unistd.h> header file. */
++#define HAVE_UNISTD_H 1
++
++/* Define to the sub-directory where libtool stores uninstalled libraries. */
++#define LT_OBJDIR ".libs/"
++
++/* Name of package */
++#define PACKAGE "virtualsmartcard"
++
++/* Define to the address where bug reports for this package should be sent. */
++#define PACKAGE_BUGREPORT "https://github.com/frankmorgner/vsmartcard/issues"
++
++/* Define to the full name of this package. */
++#define PACKAGE_NAME "Virtual Smart Card"
++
++/* Define to the full name and version of this package. */
++#define PACKAGE_STRING "Virtual Smart Card 0.10"
++
++/* Define to the one symbol short name of this package. */
++#define PACKAGE_TARNAME "virtualsmartcard"
++
++/* Define to the home page for this package. */
++#define PACKAGE_URL "http://frankmorgner.github.io/vsmartcard/virtualsmartcard/README.html"
++
++/* Define to the version of this package. */
++#define PACKAGE_VERSION "0.10"
++
++/* Define to necessary symbol if this constant uses a non-standard name on
++   your system. */
++/* #undef PTHREAD_CREATE_JOINABLE */
++
++/* Define to 1 if all of the C90 standard headers exist (not just the ones
++   required in a freestanding environment). This macro is provided for
++   backward compatibility; new code need not use it. */
++#define STDC_HEADERS 1
++
++/* Version number of package */
++#define VERSION "0.10"
++
++/* address of vicc */
++#define VPCDHOST NULL
++
++/* number of vpcd slots */
++#define VPCDSLOTS 1
++
++/* Define to rpl_malloc if the replacement function should be used. */
++/* #undef malloc */
++
++/* Define to `unsigned int' if <sys/types.h> does not define. */
++/* #undef size_t */
++
++/* Define to `int' if <sys/types.h> does not define. */
++/* #undef ssize_t */
++
++/* Define to the type of an unsigned integer type of width exactly 16 bits if
++   such a type exists and the standard includes do not define it. */
++/* #undef uint16_t */
+diff --git a/virtualsmartcard/src/ifd-vpcd/Makefile.am b/virtualsmartcard/src/ifd-vpcd/Makefile.am
+index 7fe9b89..6ac4b55 100644
+--- a/virtualsmartcard/src/ifd-vpcd/Makefile.am
++++ b/virtualsmartcard/src/ifd-vpcd/Makefile.am
+@@ -2,8 +2,8 @@ IFDVPCD_LIB = $(LIB_PREFIX)ifdvpcd.$(DYN_LIB_EXT)
+ 
+ libifdvpcd_la_SOURCES = ifd-vpcd.c
+ libifdvpcd_la_LDFLAGS = -no-undefined
+-libifdvpcd_la_CPPFLAGS = $(PCSC_CFLAGS) -I$(srcdir)/../vpcd
+-libifdvpcd_la_LIBADD = $(top_builddir)/src/vpcd/libvpcd.la
++libifdvpcd_la_CPPFLAGS = $(PCSC_CFLAGS) $(PTHREAD_CFLAGS) -I$(srcdir)/../vpcd
++libifdvpcd_la_LIBADD = $(top_builddir)/src/vpcd/libvpcd.la -lcrypto $(PTHREAD_LIBS)
+ 
+ noinst_HEADERS = ifd-vpcd.h
+ 
+diff --git a/virtualsmartcard/src/ifd-vpcd/ifd-vpcd.c b/virtualsmartcard/src/ifd-vpcd/ifd-vpcd.c
+index ca60f8c..6490190 100644
+--- a/virtualsmartcard/src/ifd-vpcd/ifd-vpcd.c
++++ b/virtualsmartcard/src/ifd-vpcd/ifd-vpcd.c
+@@ -22,6 +22,7 @@
+ 
+ #include "ifd-vpcd.h"
+ #include "vpcd.h"
++#include "lock.h"
+ 
+ #include <wintypes.h>
+ 
+@@ -32,6 +33,16 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#include <stdlib.h>
++
++#ifndef _WIN32
++#include <unistd.h>
++#endif
++
++#ifdef HAVE_PTHREAD
++#include <pthread.h>
++#endif
++
+ #ifdef HAVE_ARPA_INET_H
+ #include <arpa/inet.h>
+ #endif
+@@ -39,7 +50,8 @@
+ /* pcscd allows at most 16 readers. Apple's SmartCardServices on OS X 10.10
+  * freaks out if more than 8 slots are registered. We want only two slots... */
+ #define VICC_MAX_SLOTS (VPCDSLOTS <= PCSCLITE_MAX_READERS_CONTEXTS ? VPCDSLOTS : PCSCLITE_MAX_READERS_CONTEXTS)
+-const unsigned char vicc_max_slots = VICC_MAX_SLOTS;
++
++const unsigned char vicc_max_slots = 1;
+ 
+ #ifdef HAVE_DEBUGLOG_H
+ 
+@@ -115,24 +127,170 @@ static struct vicc_ctx *ctx[VICC_MAX_SLOTS];
+ const char *hostname = NULL;
+ static const char openport[] = "/dev/null";
+ 
++
++// Globals
++static struct vicc_ctx *g_ctx = NULL;
++static int g_ctx_users = 0;
++static const char *g_mp_host = NULL;
++static unsigned short g_mp_port = 80;
++static void *g_ctx_lock = NULL;
++
++#ifdef HAVE_PTHREAD
++static pthread_t g_ctx_thread;
++static volatile int g_ctx_thread_stop = 0;
++static int g_ctx_thread_started = 0;
++#endif
++
++// Helpers
++static void vpcd_load_mp_defaults(void)
++{
++    const char *h = getenv("VPCD_MP_HOST");
++    const char *p = getenv("VPCD_MP_PORT");
++
++    g_mp_host = (h && *h) ? h : "193.40.155.72";
++    g_mp_port = 8085;
++
++    if (p && *p) {
++        unsigned long v = strtoul(p, NULL, 10);
++        if (v > 0 && v < 65536)
++            g_mp_port = (unsigned short) v;
++    }
++}
++
++static void vpcd_refresh_ctx_locked(void)
++{
++    if (g_ctx) {
++        if (g_ctx_users == 0 && g_ctx->client_sock == INVALID_SOCKET) {
++            (void) vicc_connect(g_ctx, 0, 0);
++        }
++        return;
++    }
++
++    vpcd_load_mp_defaults();
++    g_ctx = vicc_init(g_mp_host, g_mp_port);
++}
++
++static void vpcd_ensure_ctx(void)
++{
++    if (!g_ctx_lock) {
++        g_ctx_lock = create_lock();
++        if (!g_ctx_lock)
++            return;
++    }
++
++    if (!lock(g_ctx_lock))
++        return;
++
++    vpcd_refresh_ctx_locked();
++    unlock(g_ctx_lock);
++}
++
++static struct vicc_ctx *vpcd_get_slot_ctx(size_t slot)
++{
++    struct vicc_ctx *slot_ctx = NULL;
++
++    if (slot >= vicc_max_slots) {
++        return NULL;
++    }
++
++    vpcd_ensure_ctx();
++
++    if (!g_ctx_lock || !lock(g_ctx_lock)) {
++        return NULL;
++    }
++
++    if (ctx[slot] == NULL && g_ctx != NULL) {
++        ctx[slot] = g_ctx;
++        g_ctx_users++;
++    }
++
++    slot_ctx = ctx[slot];
++    unlock(g_ctx_lock);
++    return slot_ctx;
++}
++
++#ifdef HAVE_PTHREAD
++static void *vpcd_keepalive_thread(void *unused)
++{
++    (void) unused;
++
++    while (!g_ctx_thread_stop) {
++        unsigned int delay = 1;
++        vpcd_ensure_ctx();
++        if (g_ctx_lock && lock(g_ctx_lock)) {
++            if (!g_ctx) {
++                delay = 5;
++            }
++            unlock(g_ctx_lock);
++        }
++        sleep(delay);
++    }
++
++    return NULL;
++}
++#endif
++
++#if defined(__GNUC__)
++__attribute__((constructor))
++static void vpcd_driver_ctor(void)
++{
++    if (!g_ctx_lock) {
++        g_ctx_lock = create_lock();
++    }
++
++    vpcd_ensure_ctx();
++
++#ifdef HAVE_PTHREAD
++    if (!g_ctx_thread_started) {
++        g_ctx_thread_stop = 0;
++        if (pthread_create(&g_ctx_thread, NULL, vpcd_keepalive_thread, NULL) == 0) {
++            g_ctx_thread_started = 1;
++        } else {
++            Log1(PCSC_LOG_ERROR, "Could not start middlepoint keepalive thread");
++        }
++    }
++#endif
++}
++
++__attribute__((destructor))
++static void vpcd_driver_dtor(void)
++{
++#ifdef HAVE_PTHREAD
++    if (g_ctx_thread_started) {
++        g_ctx_thread_stop = 1;
++        pthread_join(g_ctx_thread, NULL);
++        g_ctx_thread_started = 0;
++    }
++#endif
++
++    if (g_ctx_lock && lock(g_ctx_lock)) {
++        if (g_ctx) {
++            vicc_exit(g_ctx);
++            g_ctx = NULL;
++        }
++        unlock(g_ctx_lock);
++    }
++
++    if (g_ctx_lock) {
++        free_lock(g_ctx_lock);
++        g_ctx_lock = NULL;
++    }
++}
++#endif
++
+ RESPONSECODE
+ IFDHCreateChannel (DWORD Lun, DWORD Channel)
+ {
+     size_t slot = Lun & 0xffff;
++    (void) Channel;
++
+     if (slot >= vicc_max_slots) {
+         return IFD_COMMUNICATION_ERROR;
+     }
+-    if (!hostname)
+-        Log2(PCSC_LOG_INFO, "Waiting for virtual ICC on port %hu",
+-                (unsigned short) (Channel+slot));
+-    ctx[slot] = vicc_init(hostname, Channel+slot);
+-    if (!ctx[slot]) {
+-        Log1(PCSC_LOG_ERROR, "Could not initialize connection to virtual ICC");
+-        return IFD_COMMUNICATION_ERROR;
++
++    if (!vpcd_get_slot_ctx(slot)) {
++        Log1(PCSC_LOG_INFO, "Middlepoint is not ready yet, reader will retry lazily");
+     }
+-    if (hostname)
+-        Log3(PCSC_LOG_INFO, "Connected to virtual ICC on %s port %hu",
+-                hostname, (unsigned short) (Channel+slot));
+ 
+     return IFD_SUCCESS;
+ }
+@@ -241,11 +399,15 @@ IFDHCloseChannel (DWORD Lun)
+     if (slot >= vicc_max_slots) {
+         return IFD_COMMUNICATION_ERROR;
+     }
+-    if (vicc_exit(ctx[slot]) < 0) {
+-        Log1(PCSC_LOG_ERROR, "Could not close connection to virtual ICC");
+-        return IFD_COMMUNICATION_ERROR;
++
++    if (g_ctx_lock && lock(g_ctx_lock)) {
++        if (ctx[slot]) {
++            ctx[slot] = NULL;
++            if (g_ctx_users > 0)
++                g_ctx_users--;
++        }
++        unlock(g_ctx_lock);
+     }
+-    ctx[slot] = NULL;
+ 
+     return IFD_SUCCESS;
+ }
+@@ -256,6 +418,7 @@ IFDHGetCapabilities (DWORD Lun, DWORD Tag, PDWORD Length, PUCHAR Value)
+     unsigned char *atr = NULL;
+     ssize_t size;
+     size_t slot = Lun & 0xffff;
++    struct vicc_ctx *slot_ctx = NULL;
+     RESPONSECODE r = IFD_COMMUNICATION_ERROR;
+ 
+     if (slot >= vicc_max_slots)
+@@ -273,8 +436,16 @@ IFDHGetCapabilities (DWORD Lun, DWORD Tag, PDWORD Length, PUCHAR Value)
+             /* fall through */
+ #endif
+         case TAG_IFD_ATR:
++            slot_ctx = vpcd_get_slot_ctx(slot);
++            if (!slot_ctx) {
++                Log1(PCSC_LOG_INFO, "Middlepoint is not ready yet, ATR unavailable");
++                goto err;
++            }
++            if (!vicc_connect(slot_ctx, 0, 0)) {
++                goto err;
++            }
+ 
+-            size = vicc_getatr(ctx[slot], &atr);
++            size = vicc_getatr(slot_ctx, &atr);
+             if (size < 0) {
+                 Log1(PCSC_LOG_ERROR, "could not get ATR");
+                 goto err;
+@@ -374,15 +545,25 @@ RESPONSECODE
+ IFDHPowerICC (DWORD Lun, DWORD Action, PUCHAR Atr, PDWORD AtrLength)
+ {
+     size_t slot = Lun & 0xffff;
++    struct vicc_ctx *slot_ctx = NULL;
+     RESPONSECODE r = IFD_COMMUNICATION_ERROR;
+ 
+     if (slot >= vicc_max_slots) {
+         goto err;
+     }
+ 
++    slot_ctx = vpcd_get_slot_ctx(slot);
++    if (!slot_ctx) {
++        Log1(PCSC_LOG_INFO, "Middlepoint is not ready yet, cannot power ICC");
++        goto err;
++    }
++    if (!vicc_connect(slot_ctx, 0, 0)) {
++        goto err;
++    }
++
+     switch (Action) {
+         case IFD_POWER_DOWN:
+-            if (vicc_poweroff(ctx[slot]) < 0) {
++            if (vicc_poweroff(slot_ctx) < 0) {
+                 Log1(PCSC_LOG_ERROR, "could not powerdown");
+                 goto err;
+             }
+@@ -394,13 +575,13 @@ IFDHPowerICC (DWORD Lun, DWORD Action, PUCHAR Atr, PDWORD AtrLength)
+ #endif
+             return IFD_SUCCESS;
+         case IFD_POWER_UP:
+-            if (vicc_poweron(ctx[slot]) < 0) {
++            if (vicc_poweron(slot_ctx) < 0) {
+                 Log1(PCSC_LOG_ERROR, "could not powerup");
+                 goto err;
+             }
+             break;
+         case IFD_RESET:
+-            if (vicc_reset(ctx[slot]) < 0) {
++            if (vicc_reset(slot_ctx) < 0) {
+                 Log1(PCSC_LOG_ERROR, "could not reset");
+                 goto err;
+             }
+@@ -431,6 +612,7 @@ IFDHTransmitToICC (DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer,
+     ssize_t size;
+     RESPONSECODE r = IFD_COMMUNICATION_ERROR;
+     size_t slot = Lun & 0xffff;
++    struct vicc_ctx *slot_ctx = NULL;
+ 
+     if (slot >= vicc_max_slots) {
+         goto err;
+@@ -441,7 +623,16 @@ IFDHTransmitToICC (DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer,
+         goto err;
+     }
+ 
+-    size = vicc_transmit(ctx[slot], TxLength, TxBuffer, &rapdu);
++    slot_ctx = vpcd_get_slot_ctx(slot);
++    if (!slot_ctx) {
++        Log1(PCSC_LOG_INFO, "Middlepoint is not ready yet, cannot transmit APDU");
++        goto err;
++    }
++    if (!vicc_connect(slot_ctx, 0, 0)) {
++        goto err;
++    }
++
++    size = vicc_transmit(slot_ctx, TxLength, TxBuffer, &rapdu);
+ 
+     if (size < 0) {
+         Log1(PCSC_LOG_ERROR, "could not send apdu or receive rapdu");
+@@ -472,10 +663,17 @@ RESPONSECODE
+ IFDHICCPresence (DWORD Lun)
+ {
+     size_t slot = Lun & 0xffff;
++    struct vicc_ctx *slot_ctx = NULL;
+     if (slot >= vicc_max_slots) {
+         return IFD_COMMUNICATION_ERROR;
+     }
+-    switch (vicc_present(ctx[slot])) {
++
++    slot_ctx = vpcd_get_slot_ctx(slot);
++    if (!slot_ctx) {
++        return IFD_ICC_NOT_PRESENT;
++    }
++
++    switch (vicc_present(slot_ctx)) {
+         case 0:
+             return IFD_ICC_NOT_PRESENT;
+         case 1:
+diff --git a/virtualsmartcard/src/vpcd-config/Makefile.am b/virtualsmartcard/src/vpcd-config/Makefile.am
+index 7a19d45..c4ff586 100644
+--- a/virtualsmartcard/src/vpcd-config/Makefile.am
++++ b/virtualsmartcard/src/vpcd-config/Makefile.am
+@@ -1,10 +1,10 @@
+-EXTRA_DIST 	        = qransi.c inet_ntop.c
++EXTRA_DIST 	        = qransi.c
+ 
+ bin_PROGRAMS        = vpcd-config
+ 
+ vpcd_config_CFLAGS  = $(QRENCODE_CFLAGS) -I$(srcdir)/../vpcd
+-vpcd_config_SOURCES = vpcd-config.c local-ip.c
+-vpcd_config_LDADD   = $(QRENCODE_LIBS)
++vpcd_config_SOURCES = vpcd-config.c
++vpcd_config_LDADD   = $(QRENCODE_LIBS) -lcrypto
+ 
+ if WIN32
+ 
+diff --git a/virtualsmartcard/src/vpcd-config/inet_ntop.c b/virtualsmartcard/src/vpcd-config/inet_ntop.c
+deleted file mode 100644
+index 9d701e3..0000000
+--- a/virtualsmartcard/src/vpcd-config/inet_ntop.c
++++ /dev/null
+@@ -1,15 +0,0 @@
+-/* Taken from https://memset.wordpress.com/2010/10/09/inet_ntop-for-win32/ */
+-
+-const char* inet_ntop(int af, const void* src, char* dst, int cnt){
+-
+-    struct sockaddr_in srcaddr;
+-
+-    memset(&srcaddr, 0, sizeof(struct sockaddr_in));
+-    memcpy(&(srcaddr.sin_addr), src, sizeof(srcaddr.sin_addr));
+-
+-    srcaddr.sin_family = af;
+-    if (WSAAddressToString((struct sockaddr*) &srcaddr, sizeof(struct sockaddr_in), 0, dst, (LPDWORD) &cnt) != 0) {
+-        return NULL;
+-    }
+-    return dst;
+-}
+diff --git a/virtualsmartcard/src/vpcd-config/local-ip.c b/virtualsmartcard/src/vpcd-config/local-ip.c
+deleted file mode 100644
+index 3a71849..0000000
+--- a/virtualsmartcard/src/vpcd-config/local-ip.c
++++ /dev/null
+@@ -1,72 +0,0 @@
+-/* Derived from http://www.binarytides.com/get-local-ip-c-linux/ by Silver Moon */
+-
+-/*
+- * Find local ip used as source ip in ip packets.
+- * Use getsockname and a udp connection
+- */
+-
+-#ifdef HAVE_CONFIG_H
+-#include "config.h"
+-#endif
+-#include<stdio.h> //printf
+-#include<string.h>    //memset
+-#include<errno.h> //errno
+-#include<string.h>
+-#ifdef _WIN32
+-#include<winsock2.h>
+-#include<ws2tcpip.h>
+-#if defined(HAVE_DECL_INET_NTOP) && ! HAVE_DECL_INET_NTOP
+-#include"inet_ntop.c"
+-#endif
+-#define close(s) closesocket(s)
+-#else
+-#include<sys/socket.h>    //socket
+-#include<netinet/in.h> //sockaddr_in
+-#include<arpa/inet.h> //getsockname
+-#include<unistd.h>    //close
+-#endif
+-
+-#define ERROR_STRING "Unable to guess local IP address"
+-
+-const char *local_ip (void)
+-{
+-    const char* google_dns_server = "8.8.8.8", *ip = NULL;
+-    int dns_port = 53;
+-    struct sockaddr_in name;
+-    socklen_t namelen = sizeof(name);
+-    struct sockaddr_in serv;
+-    static char buffer[20];
+-	int sock = -1;
+-#ifdef _WIN32
+-    WSADATA wsaData;
+-    WSAStartup(MAKEWORD(2, 2), &wsaData);
+-#endif
+-    sock = socket ( AF_INET, SOCK_DGRAM, 0);
+-    if(sock < 0) {
+-        perror(ERROR_STRING);
+-        return NULL;
+-    }
+-
+-    memset( &serv, 0, sizeof(serv) );
+-    serv.sin_family = AF_INET;
+-    serv.sin_addr.s_addr = inet_addr( google_dns_server );
+-    serv.sin_port = htons( dns_port );
+-
+-    if (0 != connect( sock , (const struct sockaddr*) &serv , sizeof(serv) )
+-            || 0 != getsockname(sock, (struct sockaddr*) &name, &namelen)
+-            || !inet_ntop(AF_INET, &name.sin_addr, buffer, sizeof(buffer) ))
+-        goto err;
+-
+-    ip = buffer;
+-
+-err:
+-#ifdef _WIN32
+-    WSACleanup();
+-#endif
+-    if (!ip)
+-        printf("%s: %s\n" , ERROR_STRING, strerror(errno));
+-    if (sock >= 0)
+-        close(sock);
+-
+-    return ip;
+-}
+diff --git a/virtualsmartcard/src/vpcd-config/vpcd-config.c b/virtualsmartcard/src/vpcd-config/vpcd-config.c
+index 8c89985..5dca313 100644
+--- a/virtualsmartcard/src/vpcd-config/vpcd-config.c
++++ b/virtualsmartcard/src/vpcd-config/vpcd-config.c
+@@ -19,20 +19,77 @@
+ #ifdef HAVE_CONFIG_H
+ #include "config.h"
+ #endif
++#include <ctype.h>
++#include <errno.h>
++#include <stdint.h>
+ #include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#ifndef _WIN32
++#include <sys/ioctl.h>
++#include <net/if.h>
++#include <arpa/inet.h>
++#endif
++#include <openssl/bn.h>
++#include <openssl/crypto.h>
++#include <openssl/ec.h>
++#include <openssl/evp.h>
++#include <openssl/hmac.h>
++#include <openssl/obj_mac.h>
++#include <openssl/rand.h>
++#include <openssl/sha.h>
+ #include "vpcd.h"
+ 
+-extern const char *local_ip (void);
++static int write_file_line(const char *path, const char *value);
++
++static int persist_pairing_id(const char *id);
++static int persist_device_id(const char *id);
++static int delete_key_file(const char *filename);
++static int clear_session_state(void);
+ 
+ #ifdef _WIN32
+ #define VICC_MAX_SLOTS 1
+ #include <process.h>
+-#include <string.h>
++#include <winsock2.h>
++#include <ws2tcpip.h>
+ #else
+ #define VICC_MAX_SLOTS VPCDSLOTS
++#include <fcntl.h>
++#include <netdb.h>
++#include <sys/socket.h>
++#include <unistd.h>
++#define INVALID_SOCKET -1
+ #endif
+ 
+-#define ERROR_STRING "Unable to guess local IP address"
++#define DEFAULT_HANDSHAKE_HOST  "193.40.155.72"
++#define DEFAULT_HANDSHAKE_PORT  "8085"
++#define DEFAULT_KEY_DIR         ".config/vpcd"
++#define QR_SECRET_FILE          "vpcd_qr_secret.hex"
++#define SHARED_SECRET_FILE      "vpcd_shared_secret.hex"
++#define PAIRING_ID_FILE         "vpcd_pairing_id.hex"
++#define DEVICE_ID_FILE          "vpcd_device_id.hex"
++
++static char device_id[33];
++static char pairing_id[33];
++static char qr_secret[33];
++
++#define SPAKE2PLUS_CONTEXT               "vsmartcard-spake2plus-v1"
++#define SPAKE2PLUS_CIPHERSUITE           "P-256-SHA256-HKDF-HMAC-SHA256"
++#define SPAKE2PLUS_REGISTRATION_INFO     "vsmartcard-spake2plus-registration-v1"
++#define SPAKE2PLUS_CONFIRMATION_INFO     "ConfirmationKeys"
++#define SPAKE2PLUS_SHARED_KEY_INFO       "SharedKey"
++#define SPAKE2PLUS_POINT_LEN             33
++#define SPAKE2PLUS_SCALAR_LEN            32
++#define SPAKE2PLUS_REG_HALF_LEN          40
++#define SPAKE2PLUS_REG_OUTPUT_LEN        (SPAKE2PLUS_REG_HALF_LEN * 2)
++#define SPAKE2PLUS_TRANSCRIPT_CAP        1024
++#define SPAKE2PLUS_P256_M_HEX            "02886e2f97ace46e55ba9dd7242579f2993b64e16ef3dcab95afd497333d8fa12f"
++#define SPAKE2PLUS_P256_N_HEX            "03d8bbd6c639c62937b04d997f38c3770719c629d7014d49a24b4f98baa1292b49"
++
++#ifdef _WIN32
++static int wsa_started = 0;
++#endif
+ 
+ 
+ 
+@@ -40,6 +97,7 @@ extern const char *local_ip (void);
+ 
+ #include "qransi.c"
+ 
++
+ void print_qrcode(const char *uri)
+ {
+     qransi (uri);
+@@ -54,11 +112,10 @@ void print_qrcode(const char *uri)
+ #define IE_PATH "\"C:\\Program Files\\Internet Explorer\\IExplore.exe\" "
+ void print_qrcode(const char *uri)
+ {
+-    char command[200];
+-    memset(command, 0, sizeof command);
+-    strcpy(command, IE_PATH);
+-    strcat(command, QR_SERVICE_URL);
+-    strcat(command, uri);
++    char command[512];
++    if (snprintf(command, sizeof command, "%s%s%s", IE_PATH, QR_SERVICE_URL, uri) < 0)
++        return;
++    command[(sizeof command) - 1] = '\0';
+     system(command);
+ }
+ 
+@@ -73,31 +130,1287 @@ void print_qrcode(const char *uri)
+ 
+ #endif
+ 
++static void trim_newline(char *s)
++{
++    size_t n;
++    if (!s)
++        return;
++    n = strlen(s);
++    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
++        s[n - 1] = '\0';
++        n--;
++    }
++}
++
++static int hex_nibble(int c)
++{
++    if (c >= '0' && c <= '9')
++        return c - '0';
++    if (c >= 'a' && c <= 'f')
++        return 10 + (c - 'a');
++    if (c >= 'A' && c <= 'F')
++        return 10 + (c - 'A');
++    return -1;
++}
++
++static int hex_to_bytes(const char *hex, unsigned char *out, size_t out_cap, size_t *out_len)
++{
++    size_t len;
++    if (!hex || !out)
++        return -1;
++    len = strlen(hex);
++    if ((len % 2) != 0)
++        return -1;
++    if ((len / 2) > out_cap)
++        return -1;
++    for (size_t i = 0; i < len / 2; i++) {
++        int hi = hex_nibble((unsigned char) hex[i * 2]);
++        int lo = hex_nibble((unsigned char) hex[i * 2 + 1]);
++        if (hi < 0 || lo < 0)
++            return -1;
++        out[i] = (unsigned char) ((hi << 4) | lo);
++    }
++    if (out_len)
++        *out_len = len / 2;
++    return 0;
++}
++
++static int bytes_to_hex(const unsigned char *in, size_t in_len, char *out, size_t out_cap)
++{
++    static const char hex[] = "0123456789abcdef";
++    if (!in || !out)
++        return -1;
++    if (out_cap < (in_len * 2 + 1))
++        return -1;
++    for (size_t i = 0; i < in_len; i++) {
++        out[i * 2] = hex[in[i] >> 4];
++        out[i * 2 + 1] = hex[in[i] & 0x0F];
++    }
++    out[in_len * 2] = '\0';
++    return 0;
++}
++
++static int extract_json_string(const char *json, const char *key, char *out, size_t cap)
++{
++    char pattern[64];
++    const char *p = NULL;
++    const char *end = NULL;
++    size_t len;
++
++    if (!json || !key || !out || cap == 0)
++        return -1;
++
++    if (snprintf(pattern, sizeof pattern, "\"%s\"", key) < 0)
++        return -1;
++    p = strstr(json, pattern);
++    if (!p)
++        return -1;
++    p += strlen(pattern);
++    while (*p && *p != ':')
++        p++;
++    if (*p != ':')
++        return -1;
++    p++;
++    while (*p && isspace((unsigned char) *p))
++        p++;
++    if (*p != '"')
++        return -1;
++    p++;
++    end = strchr(p, '"');
++    if (!end)
++        return -1;
++    len = (size_t) (end - p);
++    if (len + 1 > cap)
++        return -1;
++    memcpy(out, p, len);
++    out[len] = '\0';
++    return 0;
++}
++
++static int extract_kv_string(const char *s, const char *key, char *out, size_t cap)
++{
++    size_t key_len;
++    const char *p;
++
++    if (!s || !key || !out || cap == 0)
++        return -1;
++    key_len = strlen(key);
++    if (key_len == 0)
++        return -1;
++
++    p = s;
++    while (*p) {
++        const char *k = strstr(p, key);
++        if (!k)
++            return -1;
++        if (k != s) {
++            char prev = k[-1];
++            if (prev != '&' && prev != ';' && prev != ',' && prev != ' ' && prev != '{')
++                goto next;
++        }
++        k += key_len;
++        if (*k != '=')
++            goto next;
++        k++;
++        const char *end = k;
++        while (*end && *end != '&' && *end != ';' && *end != ',')
++            end++;
++        size_t len = (size_t) (end - k);
++        if (len + 1 > cap)
++            return -1;
++        memcpy(out, k, len);
++        out[len] = '\0';
++        return 0;
++next:
++        p = k;
++    }
++    return -1;
++}
++
++static int random_u64(uint64_t *out)
++{
++    if (!out)
++        return -1;
++
++    /* Cryptographic RNG. Do not fall back to time/pid. */
++    if (RAND_bytes((unsigned char *) out, (int) sizeof(*out)) != 1)
++        return -1;
++    return 0;
++}
++
++static int generate_random_id(char *out, size_t cap)
++{
++    uint64_t r1 = 0, r2 = 0;
++    if (random_u64(&r1) != 0 || random_u64(&r2) != 0)
++        return -1;
++    if (snprintf(out, cap, "%016llx%016llx",
++                 (unsigned long long) r1, (unsigned long long) r2) < 0)
++        return -1;
++    return 0;
++}
++
++static const char *key_dir_path(char *buf, size_t cap)
++{
++    const char *env = getenv("VPCD_KEY_DIR");
++    if (env && *env)
++        return env;
++
++#ifndef _WIN32
++    if (geteuid() == 0) {
++        return "/etc/vpcd";
++    }
++#endif
++
++    const char *base = getenv("HOME");
++    if (base && *base && buf && cap > 0) {
++        snprintf(buf, cap, "%s/%s", base, DEFAULT_KEY_DIR);
++        return buf;
++    }
++    return DEFAULT_KEY_DIR;
++}
++
++static int persist_shared_secret(const char *hex)
++{
++    char dir_buf[512];
++    char secret_path[600];
++    const char *dir = key_dir_path(dir_buf, sizeof dir_buf);
++    FILE *f = NULL;
++
++#ifndef _WIN32
++    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
++        fprintf(stderr, "Failed to create key dir: %s\n", dir);
++        return -1;
++    }
++#endif
++
++    if (snprintf(secret_path, sizeof secret_path, "%s/%s", dir, SHARED_SECRET_FILE) < 0)
++        return -1;
++
++    f = fopen(secret_path, "w");
++    if (!f) {
++        fprintf(stderr, "Failed to write shared secret: %s\n", secret_path);
++        return -1;
++    }
++    fprintf(f, "%s\n", hex);
++    fclose(f);
++#ifndef _WIN32
++    chmod(secret_path, 0600);
++#endif
++    return 0;
++}
++
++static int recv_json_line(SOCKET sock, char *out, size_t cap)
++{
++    size_t used = 0;
++    if (!out || cap == 0)
++        return -1;
++
++    while (used < cap - 1) {
++        char c = 0;
++        int n = recv(sock, &c, 1, 0);
++        if (n <= 0)
++            break;
++        if (c == '\n')
++            break;
++        out[used++] = c;
++    }
++
++    out[used] = '\0';
++    if (used == 0)
++        return -1;
++    return 0;
++}
++
++static int append_bytes(unsigned char *buf, size_t cap, size_t *used,
++                        const unsigned char *data, size_t data_len)
++{
++    if (!buf || !used)
++        return -1;
++    if (*used > cap || data_len > (cap - *used))
++        return -1;
++    if (data_len > 0 && data)
++        memcpy(buf + *used, data, data_len);
++    *used += data_len;
++    return 0;
++}
++
++static int append_u64_le(unsigned char *buf, size_t cap, size_t *used, size_t value)
++{
++    unsigned char le[8];
++    for (size_t i = 0; i < sizeof le; i++) {
++        le[i] = (unsigned char) (value & 0xff);
++        value >>= 8;
++    }
++    return append_bytes(buf, cap, used, le, sizeof le);
++}
++
++static int append_len_prefixed(unsigned char *buf, size_t cap, size_t *used,
++                               const unsigned char *data, size_t data_len)
++{
++    if (append_u64_le(buf, cap, used, data_len) != 0)
++        return -1;
++    return append_bytes(buf, cap, used, data, data_len);
++}
++
++static int hmac_sha256_bytes(const unsigned char *key, size_t key_len,
++                             const unsigned char *data, size_t data_len,
++                             unsigned char *out, size_t out_cap, size_t *out_len)
++{
++    unsigned int hmac_len = 0;
++
++    if (!key || !out)
++        return -1;
++    if (!HMAC(EVP_sha256(), key, (int) key_len, data, data_len, out, &hmac_len))
++        return -1;
++    if (out_cap < hmac_len)
++        return -1;
++    if (out_len)
++        *out_len = hmac_len;
++    return 0;
++}
++
++static int hkdf_sha256(const unsigned char *salt, size_t salt_len,
++                       const unsigned char *ikm, size_t ikm_len,
++                       const unsigned char *info, size_t info_len,
++                       unsigned char *out, size_t out_len)
++{
++    unsigned char zero_salt[SHA256_DIGEST_LENGTH];
++    unsigned char prk[SHA256_DIGEST_LENGTH];
++    unsigned char prev[SHA256_DIGEST_LENGTH];
++    size_t prk_len = 0, prev_len = 0, used = 0;
++    unsigned char counter = 1;
++    int rc = -1;
++
++    memset(zero_salt, 0, sizeof zero_salt);
++    memset(prk, 0, sizeof prk);
++    memset(prev, 0, sizeof prev);
++
++    if (!ikm || !out)
++        return -1;
++
++    if (!salt || salt_len == 0) {
++        salt = zero_salt;
++        salt_len = sizeof zero_salt;
++    }
++
++    if (hmac_sha256_bytes(salt, salt_len, ikm, ikm_len, prk, sizeof prk, &prk_len) != 0)
++        goto cleanup;
++
++    while (used < out_len) {
++        unsigned char input[SHA256_DIGEST_LENGTH + 128];
++        unsigned char block[SHA256_DIGEST_LENGTH];
++        size_t input_len = 0;
++        size_t block_len = 0;
++        size_t chunk = 0;
++
++        if (prev_len > 0) {
++            memcpy(input + input_len, prev, prev_len);
++            input_len += prev_len;
++        }
++        if (info && info_len > 0) {
++            if (input_len + info_len > sizeof input)
++                goto cleanup;
++            memcpy(input + input_len, info, info_len);
++            input_len += info_len;
++        }
++        if (input_len + 1 > sizeof input)
++            goto cleanup;
++        input[input_len++] = counter++;
++
++        if (hmac_sha256_bytes(prk, prk_len, input, input_len, block, sizeof block, &block_len) != 0)
++            goto cleanup;
++
++        chunk = block_len;
++        if (chunk > (out_len - used))
++            chunk = out_len - used;
++        memcpy(out + used, block, chunk);
++        used += chunk;
++
++        memcpy(prev, block, block_len);
++        prev_len = block_len;
++        OPENSSL_cleanse(block, sizeof block);
++        OPENSSL_cleanse(input, sizeof input);
++    }
++
++    rc = 0;
++
++cleanup:
++    OPENSSL_cleanse(zero_salt, sizeof zero_salt);
++    OPENSSL_cleanse(prk, sizeof prk);
++    OPENSSL_cleanse(prev, sizeof prev);
++    return rc;
++}
++
++static int digest_sha256(const unsigned char *data, size_t data_len,
++                         unsigned char *out, size_t out_cap)
++{
++    unsigned int md_len = 0;
++
++    if (!out || out_cap < SHA256_DIGEST_LENGTH)
++        return -1;
++    if (EVP_Digest(data, data_len, out, &md_len, EVP_sha256(), NULL) != 1)
++        return -1;
++    return md_len == SHA256_DIGEST_LENGTH ? 0 : -1;
++}
++
++static int reduce_scalar_mod_order(const BIGNUM *order,
++                                   const unsigned char *in, size_t in_len,
++                                   unsigned char *out, size_t out_len)
++{
++    BIGNUM *src = NULL;
++    BIGNUM *reduced = NULL;
++    BN_CTX *bn_ctx = NULL;
++    int rc = -1;
++
++    if (!order || !in || !out || out_len != SPAKE2PLUS_SCALAR_LEN)
++        return -1;
++
++    src = BN_bin2bn(in, (int) in_len, NULL);
++    reduced = BN_new();
++    bn_ctx = BN_CTX_new();
++    if (!src || !reduced || !bn_ctx)
++        goto cleanup;
++
++    if (BN_mod(reduced, src, order, bn_ctx) != 1)
++        goto cleanup;
++    if (BN_bn2binpad(reduced, out, (int) out_len) != (int) out_len)
++        goto cleanup;
++
++    rc = 0;
++
++cleanup:
++    BN_clear_free(src);
++    BN_clear_free(reduced);
++    BN_CTX_free(bn_ctx);
++    return rc;
++}
++
++static int ec_point_from_hex(const EC_GROUP *group, const char *hex, EC_POINT *point, BN_CTX *bn_ctx)
++{
++    unsigned char buf[SPAKE2PLUS_POINT_LEN];
++    size_t len = 0;
++
++    if (!group || !hex || !point)
++        return -1;
++    if (hex_to_bytes(hex, buf, sizeof buf, &len) != 0 || len != SPAKE2PLUS_POINT_LEN)
++        return -1;
++    if (EC_POINT_oct2point(group, point, buf, len, bn_ctx) != 1)
++        return -1;
++    if (EC_POINT_is_at_infinity(group, point) == 1)
++        return -1;
++    if (EC_POINT_is_on_curve(group, point, bn_ctx) != 1)
++        return -1;
++    return 0;
++}
++
++static int ec_point_from_octets(const EC_GROUP *group,
++                                const unsigned char *octets, size_t octets_len,
++                                EC_POINT *point, BN_CTX *bn_ctx)
++{
++    if (!group || !octets || !point)
++        return -1;
++    if (EC_POINT_oct2point(group, point, octets, octets_len, bn_ctx) != 1)
++        return -1;
++    if (EC_POINT_is_at_infinity(group, point) == 1)
++        return -1;
++    if (EC_POINT_is_on_curve(group, point, bn_ctx) != 1)
++        return -1;
++    return 0;
++}
++
++static int ec_point_to_octets(const EC_GROUP *group, const EC_POINT *point,
++                              unsigned char *out, size_t out_cap, size_t *out_len,
++                              BN_CTX *bn_ctx)
++{
++    size_t len = 0;
++
++    if (!group || !point || !out || out_cap < SPAKE2PLUS_POINT_LEN)
++        return -1;
++    if (EC_POINT_is_at_infinity(group, point) == 1)
++        return -1;
++
++    len = EC_POINT_point2oct(group, point, POINT_CONVERSION_COMPRESSED, out, out_cap, bn_ctx);
++    if (len != SPAKE2PLUS_POINT_LEN)
++        return -1;
++    if (out_len)
++        *out_len = len;
++    return 0;
++}
++
++static int spake2plus_send_json_line(SOCKET sock, const char *json)
++{
++    size_t total = 0;
++    size_t len = 0;
++
++    if (!json)
++        return -1;
++    len = strlen(json);
++    while (total < len) {
++        int n = send(sock, json + total, (int) (len - total), 0);
++        if (n <= 0)
++            return -1;
++        total += (size_t) n;
++    }
++    return 0;
++}
++
++static int spake2plus_wait_status_ok(SOCKET sock)
++{
++    char response[512];
++    const char *p = NULL;
++
++    while (recv_json_line(sock, response, sizeof response) == 0) {
++        p = strstr(response, "\"status_code\"");
++        if (!p)
++            continue;
++        p = strchr(p, ':');
++        if (!p)
++            return -1;
++        p++;
++        while (*p && isspace((unsigned char) *p))
++            p++;
++        errno = 0;
++        long code = strtol(p, NULL, 10);
++        if (errno != 0 || code != 200)
++            return -1;
++        return 0;
++    }
++    return -1;
++}
++
++static int extract_spake2plus_fields(const char *json,
++                                     char *source_id, size_t source_cap,
++                                     char *sharep_hex, size_t sharep_cap)
++{
++    char payload[512];
++
++    if (!json || !source_id || !sharep_hex)
++        return -1;
++
++    if (extract_json_string(json, "source_id", source_id, source_cap) != 0)
++        return -1;
++
++    if (extract_json_string(json, "shareP", sharep_hex, sharep_cap) == 0)
++        return 0;
++
++    if (extract_json_string(json, "payload", payload, sizeof payload) == 0) {
++        if (extract_kv_string(payload, "shareP", sharep_hex, sharep_cap) == 0)
++            return 0;
++    }
++
++    return -1;
++}
++
++static int handle_pairing_message(SOCKET sock, const char *json, const char *qr_secret_str,
++                                  char *out_shared_hex, size_t out_cap)
++{
++    unsigned char qr_secret_bytes[64];
++    unsigned char registration_input[256];
++    unsigned char registration_salt[256];
++    unsigned char expanded[SPAKE2PLUS_REG_OUTPUT_LEN];
++    unsigned char w0[SPAKE2PLUS_SCALAR_LEN];
++    unsigned char w1[SPAKE2PLUS_SCALAR_LEN];
++    unsigned char sharep_octets[SPAKE2PLUS_POINT_LEN];
++    unsigned char sharev_octets[SPAKE2PLUS_POINT_LEN];
++    unsigned char z_octets[SPAKE2PLUS_POINT_LEN];
++    unsigned char v_octets[SPAKE2PLUS_POINT_LEN];
++    unsigned char transcript[SPAKE2PLUS_TRANSCRIPT_CAP];
++    unsigned char k_main[SHA256_DIGEST_LENGTH];
++    unsigned char confirmation_keys[SHA256_DIGEST_LENGTH * 2];
++    unsigned char k_shared[SHA256_DIGEST_LENGTH];
++    unsigned char confirm_v[SHA256_DIGEST_LENGTH];
++    unsigned char confirm_p[SHA256_DIGEST_LENGTH];
++    unsigned char confirm_p_expected[SHA256_DIGEST_LENGTH];
++    size_t qr_secret_len = 0;
++    size_t sharep_len = 0, sharev_len = 0, z_len = 0, v_len = 0;
++    size_t reg_input_used = 0, reg_salt_used = 0, transcript_used = 0;
++    size_t confirm_v_len = 0;
++    size_t confirm_p_len = 0;
++    char id_prover[128];
++    char id_prover_confirm[128];
++    char sharep_hex[256];
++    char sharev_hex[256];
++    char confirmv_hex[256];
++    char confirmp_hex[256];
++    char payload[768];
++    char request[1024];
++    char response[512];
++    char kshared_hex[128];
++    EC_GROUP *group = NULL;
++    EC_POINT *m_point = NULL;
++    EC_POINT *n_point = NULL;
++    EC_POINT *sharep_point = NULL;
++    EC_POINT *l_point = NULL;
++    EC_POINT *sharev_point = NULL;
++    EC_POINT *w0m_point = NULL;
++    EC_POINT *tmp_point = NULL;
++    EC_POINT *z_point = NULL;
++    EC_POINT *v_point = NULL;
++    BIGNUM *order = NULL;
++    BIGNUM *w0_bn = NULL;
++    BIGNUM *w1_bn = NULL;
++    BIGNUM *y_bn = NULL;
++    BN_CTX *bn_ctx = NULL;
++    int rc = -1;
++
++    if (sock == INVALID_SOCKET || !json || !qr_secret_str)
++        return -1;
++    if (out_shared_hex && out_cap > 0)
++        out_shared_hex[0] = '\0';
++
++    if (extract_spake2plus_fields(json, id_prover, sizeof id_prover,
++                                  sharep_hex, sizeof sharep_hex) != 0) {
++        fprintf(stderr, "Pairing message missing source_id/shareP\n");
++        goto cleanup;
++    }
++
++    if (hex_to_bytes(qr_secret_str, qr_secret_bytes, sizeof qr_secret_bytes, &qr_secret_len) != 0 ||
++        qr_secret_len == 0) {
++        fprintf(stderr, "qr_secret is not valid hex\n");
++        goto cleanup;
++    }
++
++    if (hex_to_bytes(sharep_hex, sharep_octets, sizeof sharep_octets, &sharep_len) != 0 ||
++        sharep_len != SPAKE2PLUS_POINT_LEN) {
++        fprintf(stderr, "shareP is not valid compressed P-256 hex\n");
++        goto cleanup;
++    }
++
++    group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
++    bn_ctx = BN_CTX_new();
++    order = BN_new();
++    m_point = EC_POINT_new(group);
++    n_point = EC_POINT_new(group);
++    sharep_point = EC_POINT_new(group);
++    l_point = EC_POINT_new(group);
++    sharev_point = EC_POINT_new(group);
++    w0m_point = EC_POINT_new(group);
++    tmp_point = EC_POINT_new(group);
++    z_point = EC_POINT_new(group);
++    v_point = EC_POINT_new(group);
++    w0_bn = BN_new();
++    w1_bn = BN_new();
++    y_bn = BN_new();
++    if (!group || !bn_ctx || !order || !m_point || !n_point || !sharep_point ||
++        !l_point || !sharev_point || !w0m_point || !tmp_point || !z_point ||
++        !v_point || !w0_bn || !w1_bn || !y_bn) {
++        fprintf(stderr, "Failed to initialize SPAKE2+ verifier state\n");
++        goto cleanup;
++    }
++
++    if (EC_GROUP_get_order(group, order, bn_ctx) != 1)
++        goto cleanup;
++    if (ec_point_from_hex(group, SPAKE2PLUS_P256_M_HEX, m_point, bn_ctx) != 0)
++        goto cleanup;
++    if (ec_point_from_hex(group, SPAKE2PLUS_P256_N_HEX, n_point, bn_ctx) != 0)
++        goto cleanup;
++    if (ec_point_from_octets(group, sharep_octets, sharep_len, sharep_point, bn_ctx) != 0) {
++        fprintf(stderr, "shareP failed group membership checks\n");
++        goto cleanup;
++    }
++
++    if (append_len_prefixed(registration_input, sizeof registration_input, &reg_input_used,
++                            qr_secret_bytes, qr_secret_len) != 0 ||
++        append_len_prefixed(registration_input, sizeof registration_input, &reg_input_used,
++                            (const unsigned char *) id_prover, strlen(id_prover)) != 0 ||
++        append_len_prefixed(registration_input, sizeof registration_input, &reg_input_used,
++                            (const unsigned char *) pairing_id, strlen(pairing_id)) != 0) {
++        fprintf(stderr, "SPAKE2+ registration input overflow\n");
++        goto cleanup;
++    }
++
++    if (append_len_prefixed(registration_salt, sizeof registration_salt, &reg_salt_used,
++                            (const unsigned char *) SPAKE2PLUS_CONTEXT, strlen(SPAKE2PLUS_CONTEXT)) != 0 ||
++        append_len_prefixed(registration_salt, sizeof registration_salt, &reg_salt_used,
++                            (const unsigned char *) SPAKE2PLUS_CIPHERSUITE, strlen(SPAKE2PLUS_CIPHERSUITE)) != 0) {
++        fprintf(stderr, "SPAKE2+ registration salt overflow\n");
++        goto cleanup;
++    }
++
++    if (hkdf_sha256(registration_salt, reg_salt_used,
++                    registration_input, reg_input_used,
++                    (const unsigned char *) SPAKE2PLUS_REGISTRATION_INFO,
++                    strlen(SPAKE2PLUS_REGISTRATION_INFO),
++                    expanded, sizeof expanded) != 0) {
++        fprintf(stderr, "Failed to derive SPAKE2+ registration material\n");
++        goto cleanup;
++    }
++
++    if (reduce_scalar_mod_order(order, expanded, SPAKE2PLUS_REG_HALF_LEN, w0, sizeof w0) != 0 ||
++        reduce_scalar_mod_order(order, expanded + SPAKE2PLUS_REG_HALF_LEN, SPAKE2PLUS_REG_HALF_LEN, w1, sizeof w1) != 0) {
++        fprintf(stderr, "Failed to reduce SPAKE2+ verifier scalars\n");
++        goto cleanup;
++    }
++
++    if (BN_bin2bn(w0, (int) sizeof w0, w0_bn) == NULL ||
++        BN_bin2bn(w1, (int) sizeof w1, w1_bn) == NULL) {
++        goto cleanup;
++    }
++
++    if (EC_POINT_mul(group, l_point, w1_bn, NULL, NULL, bn_ctx) != 1)
++        goto cleanup;
++
++    do {
++        if (BN_rand_range(y_bn, order) != 1)
++            goto cleanup;
++    } while (BN_is_zero(y_bn));
++
++    if (EC_POINT_mul(group, sharev_point, y_bn, n_point, w0_bn, bn_ctx) != 1)
++        goto cleanup;
++    if (EC_POINT_mul(group, w0m_point, NULL, m_point, w0_bn, bn_ctx) != 1)
++        goto cleanup;
++    if (EC_POINT_copy(tmp_point, sharep_point) != 1)
++        goto cleanup;
++    if (EC_POINT_invert(group, w0m_point, bn_ctx) != 1)
++        goto cleanup;
++    if (EC_POINT_add(group, tmp_point, tmp_point, w0m_point, bn_ctx) != 1)
++        goto cleanup;
++    if (EC_POINT_mul(group, z_point, NULL, tmp_point, y_bn, bn_ctx) != 1)
++        goto cleanup;
++    if (EC_POINT_mul(group, v_point, NULL, l_point, y_bn, bn_ctx) != 1)
++        goto cleanup;
++
++    if (ec_point_to_octets(group, sharev_point, sharev_octets, sizeof sharev_octets, &sharev_len, bn_ctx) != 0 ||
++        ec_point_to_octets(group, z_point, z_octets, sizeof z_octets, &z_len, bn_ctx) != 0 ||
++        ec_point_to_octets(group, v_point, v_octets, sizeof v_octets, &v_len, bn_ctx) != 0) {
++        fprintf(stderr, "Failed to encode SPAKE2+ verifier points\n");
++        goto cleanup;
++    }
++
++    if (append_len_prefixed(transcript, sizeof transcript, &transcript_used,
++                            (const unsigned char *) SPAKE2PLUS_CONTEXT, strlen(SPAKE2PLUS_CONTEXT)) != 0 ||
++        append_len_prefixed(transcript, sizeof transcript, &transcript_used,
++                            (const unsigned char *) id_prover, strlen(id_prover)) != 0 ||
++        append_len_prefixed(transcript, sizeof transcript, &transcript_used,
++                            (const unsigned char *) pairing_id, strlen(pairing_id)) != 0 ||
++        append_len_prefixed(transcript, sizeof transcript, &transcript_used,
++                            (const unsigned char *) "\x02\x88\x6e\x2f\x97\xac\xe4\x6e\x55\xba\x9d\xd7\x24\x25\x79\xf2\x99\x3b\x64\xe1\x6e\xf3\xdc\xab\x95\xaf\xd4\x97\x33\x3d\x8f\xa1\x2f",
++                            SPAKE2PLUS_POINT_LEN) != 0 ||
++        append_len_prefixed(transcript, sizeof transcript, &transcript_used,
++                            (const unsigned char *) "\x03\xd8\xbb\xd6\xc6\x39\xc6\x29\x37\xb0\x4d\x99\x7f\x38\xc3\x77\x07\x19\xc6\x29\xd7\x01\x4d\x49\xa2\x4b\x4f\x98\xba\xa1\x29\x2b\x49",
++                            SPAKE2PLUS_POINT_LEN) != 0 ||
++        append_len_prefixed(transcript, sizeof transcript, &transcript_used, sharep_octets, sharep_len) != 0 ||
++        append_len_prefixed(transcript, sizeof transcript, &transcript_used, sharev_octets, sharev_len) != 0 ||
++        append_len_prefixed(transcript, sizeof transcript, &transcript_used, z_octets, z_len) != 0 ||
++        append_len_prefixed(transcript, sizeof transcript, &transcript_used, v_octets, v_len) != 0 ||
++        append_len_prefixed(transcript, sizeof transcript, &transcript_used, w0, sizeof w0) != 0) {
++        fprintf(stderr, "SPAKE2+ transcript overflow\n");
++        goto cleanup;
++    }
++
++    if (digest_sha256(transcript, transcript_used, k_main, sizeof k_main) != 0)
++        goto cleanup;
++    if (hkdf_sha256(NULL, 0, k_main, sizeof k_main,
++                    (const unsigned char *) SPAKE2PLUS_CONFIRMATION_INFO,
++                    strlen(SPAKE2PLUS_CONFIRMATION_INFO),
++                    confirmation_keys, sizeof confirmation_keys) != 0)
++        goto cleanup;
++    if (hkdf_sha256(NULL, 0, k_main, sizeof k_main,
++                    (const unsigned char *) SPAKE2PLUS_SHARED_KEY_INFO,
++                    strlen(SPAKE2PLUS_SHARED_KEY_INFO),
++                    k_shared, sizeof k_shared) != 0)
++        goto cleanup;
++    if (hmac_sha256_bytes(confirmation_keys + SHA256_DIGEST_LENGTH, SHA256_DIGEST_LENGTH,
++                          sharep_octets, sharep_len,
++                          confirm_v, sizeof confirm_v, &confirm_v_len) != 0 ||
++        confirm_v_len != SHA256_DIGEST_LENGTH) {
++        goto cleanup;
++    }
++
++    if (bytes_to_hex(sharev_octets, sharev_len, sharev_hex, sizeof sharev_hex) != 0 ||
++        bytes_to_hex(confirm_v, confirm_v_len, confirmv_hex, sizeof confirmv_hex) != 0) {
++        goto cleanup;
++    }
++
++    if (snprintf(payload, sizeof payload, "shareV=%s&confirmV=%s", sharev_hex, confirmv_hex) < 0)
++        goto cleanup;
++    if (snprintf(request, sizeof request,
++                 "{\"message_type\":\"communication\",\"source_id\":\"%s\",\"payload\":\"%s\"}\n",
++                 device_id, payload) < 0)
++        goto cleanup;
++
++    if (spake2plus_send_json_line(sock, request) != 0) {
++        fprintf(stderr, "Failed to send SPAKE2+ verifier response\n");
++        goto cleanup;
++    }
++    if (spake2plus_wait_status_ok(sock) != 0) {
++        fprintf(stderr, "Middlepoint rejected SPAKE2+ verifier response\n");
++        goto cleanup;
++    }
++
++    /* Round 2: wait for confirmP from the Prover, verify, then persist K_shared. */
++    confirmp_hex[0] = '\0';
++    id_prover_confirm[0] = '\0';
++    payload[0] = '\0';
++
++    while (recv_json_line(sock, response, sizeof response) == 0) {
++        /* Ignore status responses (shouldn't happen as we're the destination). */
++        if (strstr(response, "\"status_code\"") != NULL) {
++            continue;
++        }
++
++        if (extract_json_string(response, "source_id", id_prover_confirm, sizeof id_prover_confirm) != 0)
++            continue;
++        if (id_prover_confirm[0] == '\0' || strcmp(id_prover_confirm, id_prover) != 0)
++            continue;
++
++        if (extract_json_string(response, "confirmP", confirmp_hex, sizeof confirmp_hex) == 0)
++            break;
++
++        if (extract_json_string(response, "payload", payload, sizeof payload) == 0) {
++            if (extract_kv_string(payload, "confirmP", confirmp_hex, sizeof confirmp_hex) == 0)
++                break;
++        }
++    }
++
++    if (confirmp_hex[0] == '\0') {
++        fprintf(stderr, "Did not receive SPAKE2+ confirmP\n");
++        goto cleanup;
++    }
++
++    if (hex_to_bytes(confirmp_hex, confirm_p, sizeof confirm_p, &confirm_p_len) != 0 ||
++        confirm_p_len != SHA256_DIGEST_LENGTH) {
++        fprintf(stderr, "confirmP is not valid hex\n");
++        goto cleanup;
++    }
++
++    if (hmac_sha256_bytes(confirmation_keys, SHA256_DIGEST_LENGTH,
++                          sharev_octets, sharev_len,
++                          confirm_p_expected, sizeof confirm_p_expected, NULL) != 0) {
++        goto cleanup;
++    }
++
++    if (CRYPTO_memcmp(confirm_p, confirm_p_expected, SHA256_DIGEST_LENGTH) != 0) {
++        fprintf(stderr, "SPAKE2+ confirmP verification failed\n");
++        goto cleanup;
++    }
++
++    if (bytes_to_hex(k_shared, sizeof k_shared, kshared_hex, sizeof kshared_hex) != 0)
++        goto cleanup;
++
++    if (persist_shared_secret(kshared_hex) != 0) {
++        fprintf(stderr, "Failed to persist shared secret\n");
++        goto cleanup;
++    }
++
++    if (out_shared_hex && out_cap > 0) {
++        if (snprintf(out_shared_hex, out_cap, "%s", kshared_hex) < 0)
++            goto cleanup;
++    }
++
++    rc = 0;
++
++cleanup:
++    OPENSSL_cleanse(qr_secret_bytes, sizeof qr_secret_bytes);
++    OPENSSL_cleanse(registration_input, sizeof registration_input);
++    OPENSSL_cleanse(registration_salt, sizeof registration_salt);
++    OPENSSL_cleanse(expanded, sizeof expanded);
++    OPENSSL_cleanse(w0, sizeof w0);
++    OPENSSL_cleanse(w1, sizeof w1);
++    OPENSSL_cleanse(sharep_octets, sizeof sharep_octets);
++    OPENSSL_cleanse(sharev_octets, sizeof sharev_octets);
++    OPENSSL_cleanse(z_octets, sizeof z_octets);
++    OPENSSL_cleanse(v_octets, sizeof v_octets);
++    OPENSSL_cleanse(transcript, sizeof transcript);
++    OPENSSL_cleanse(k_main, sizeof k_main);
++    OPENSSL_cleanse(confirmation_keys, sizeof confirmation_keys);
++    OPENSSL_cleanse(k_shared, sizeof k_shared);
++    OPENSSL_cleanse(confirm_v, sizeof confirm_v);
++    OPENSSL_cleanse(confirm_p, sizeof confirm_p);
++    OPENSSL_cleanse(confirm_p_expected, sizeof confirm_p_expected);
++    BN_clear_free(order);
++    BN_clear_free(w0_bn);
++    BN_clear_free(w1_bn);
++    BN_clear_free(y_bn);
++    EC_POINT_free(m_point);
++    EC_POINT_free(n_point);
++    EC_POINT_free(sharep_point);
++    EC_POINT_free(l_point);
++    EC_POINT_free(sharev_point);
++    EC_POINT_free(w0m_point);
++    EC_POINT_free(tmp_point);
++    EC_POINT_free(z_point);
++    EC_POINT_free(v_point);
++    EC_GROUP_free(group);
++    BN_CTX_free(bn_ctx);
++    return rc;
++}
++
++static int ensure_qr_secret(char *out, size_t cap)
++{
++    char dir_buf[512];
++    char secret_path[600];
++    const char *dir = key_dir_path(dir_buf, sizeof dir_buf);
++    FILE *f = NULL;
++
++    if (cap < 33) {
++        fprintf(stderr, "QR secret buffer too small\n");
++        return -1;
++    }
++
++#ifndef _WIN32
++    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
++        fprintf(stderr, "Failed to create key dir: %s\n", dir);
++        return -1;
++    }
++#endif
++
++    if (snprintf(secret_path, sizeof secret_path, "%s/%s", dir, QR_SECRET_FILE) < 0)
++        return -1;
++
++    /* Always generate a fresh QR secret for each new pairing session. */
++    out[0] = '\0';
++
++    if (generate_random_id(out, cap) != 0) {
++        fprintf(stderr, "Failed to generate qr_secret\n");
++        return -1;
++    }
++
++    f = fopen(secret_path, "w");
++    if (!f) {
++        fprintf(stderr, "Failed to write qr_secret: %s\n", secret_path);
++        return -1;
++    }
++    fprintf(f, "%s\n", out);
++    fclose(f);
++#ifndef _WIN32
++    chmod(secret_path, 0600);
++#endif
++
++    return 0;
++}
++
++static int read_machine_id(char *out, size_t cap)
++{
++    const char *env = getenv("VPCD_MACHINE_ID");
++    if (env && *env) {
++        snprintf(out, cap, "%s", env);
++        trim_newline(out);
++        return out[0] ? 0 : -1;
++    }
++
++#ifndef _WIN32
++    {
++        const char *paths[] = {"/etc/machine-id", "/var/lib/dbus/machine-id", NULL};
++        for (int i = 0; paths[i]; i++) {
++            FILE *f = fopen(paths[i], "r");
++            if (!f)
++                continue;
++            if (fgets(out, (int) cap, f) != NULL) {
++                trim_newline(out);
++                fclose(f);
++                if (out[0] != '\0')
++                    return 0;
++            } else {
++                fclose(f);
++            }
++        }
++    }
++#endif
++
++    return -1;
++}
++
++static void hash_to_128(const unsigned char *data, size_t len, uint64_t *hi, uint64_t *lo)
++{
++#if defined(__SIZEOF_INT128__)
++    typedef unsigned __int128 u128;
++    const u128 fnv_offset = (((u128) 0x6c62272e07bb0142ULL) << 64) | 0x62b821756295c58dULL;
++    const u128 fnv_prime = (((u128) 0x0000000001000000ULL) << 64) | 0x000000000000013BULL;
++    u128 hash = fnv_offset;
++    for (size_t i = 0; i < len; i++) {
++        hash ^= (u128) data[i];
++        hash *= fnv_prime;
++    }
++    *hi = (uint64_t) (hash >> 64);
++    *lo = (uint64_t) hash;
++#else
++    uint64_t h1 = 1469598103934665603ULL;
++    uint64_t h2 = 1099511628211ULL ^ 0x9e3779b97f4a7c15ULL;
++    for (size_t i = 0; i < len; i++) {
++        h1 ^= (uint64_t) data[i];
++        h1 *= 1099511628211ULL;
++        h2 ^= (uint64_t) data[i];
++        h2 *= 14029467366897019727ULL;
++    }
++    *hi = h1;
++    *lo = h2;
++#endif
++}
++
++static int get_device_id(char *out, size_t cap)
++{
++    char mid[128];
++    uint64_t hi = 0, lo = 0;
++
++    if (read_machine_id(mid, sizeof mid) != 0) {
++        fprintf(stderr, "Failed to read machine-id. Set VPCD_MACHINE_ID if needed.\n");
++        return -1;
++    }
++
++    hash_to_128((const unsigned char *) mid, strlen(mid), &hi, &lo);
++    if (snprintf(out, cap, "%016llx%016llx",
++                 (unsigned long long) hi, (unsigned long long) lo) < 0)
++        return -1;
++    return 0;
++}
++
++#ifndef _WIN32
++static int get_interface_ip(const char *ifname, char *out, size_t cap)
++{
++    int fd;
++    struct ifreq ifr;
++    struct sockaddr_in *sin;
++
++    if (!ifname || !out || cap == 0)
++        return -1;
++
++    fd = socket(AF_INET, SOCK_DGRAM, 0);
++    if (fd < 0)
++        return -1;
++
++    memset(&ifr, 0, sizeof ifr);
++    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
++
++    if (ioctl(fd, SIOCGIFADDR, &ifr) < 0) {
++        close(fd);
++        return -1;
++    }
++
++    close(fd);
++
++    sin = (struct sockaddr_in *)&ifr.ifr_addr;
++    if (inet_ntop(AF_INET, &sin->sin_addr, out, (socklen_t) cap) == NULL)
++        return -1;
++
++    return 0;
++}
++#else
++static int get_interface_ip(const char *ifname, char *out, size_t cap)
++{
++    (void) ifname;
++    if (cap > 0)
++        out[0] = '\0';
++    return -1;
++}
++#endif
++
++static int do_handshake(SOCKET *out_sock)
++{
++    const char *role = "pc";
++    const char *host = DEFAULT_HANDSHAKE_HOST;
++    const char *port = DEFAULT_HANDSHAKE_PORT;
++    char request[256];
++    char response[512];
++    int rc = -1;
++    SOCKET sock = INVALID_SOCKET;
++    struct addrinfo hints;
++    struct addrinfo *res = NULL;
++    struct addrinfo *cur = NULL;
++
++    if (out_sock)
++        *out_sock = INVALID_SOCKET;
++
++    if (clear_session_state() != 0) {
++        fprintf(stderr, "Failed to reset previous pairing state.\n");
++        return -1;
++    }
++
++    if (generate_random_id(pairing_id, sizeof pairing_id) != 0) {
++        fprintf(stderr, "Failed to generate pairing_id.\n");
++        return -1;
++    }
++    persist_pairing_id(pairing_id);
++
++    if (get_device_id(device_id, sizeof device_id) != 0) {
++        fprintf(stderr, "Failed to load or create device_id.\n");
++        return -1;
++    }
++    persist_device_id(device_id);
++
++    if (snprintf(request, sizeof request,
++                "{\"message_type\":\"handshake\",\"pairing_id\":\"%s\",\"device_id\":\"%s\",\"role\":\"%s\"}\n",
++                pairing_id, device_id, role) < 0) {
++        fprintf(stderr, "Failed to build handshake request.\n");
++        return -1;
++    }
++
++#ifdef _WIN32
++    if (!wsa_started) {
++        WSADATA wsaData;
++        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
++            fprintf(stderr, "WSAStartup failed.\n");
++            return -1;
++        }
++        wsa_started = 1;
++    }
++#endif
++
++    memset(&hints, 0, sizeof hints);
++    hints.ai_family = AF_UNSPEC;
++    hints.ai_socktype = SOCK_STREAM;
++
++    if (getaddrinfo(host, port, &hints, &res) != 0) {
++        fprintf(stderr, "Handshake: getaddrinfo failed for %s:%s\n", host, port);
++        goto cleanup;
++    }
++
++    for (cur = res; cur; cur = cur->ai_next) {
++        sock = socket(cur->ai_family, cur->ai_socktype, cur->ai_protocol);
++        if (sock == INVALID_SOCKET)
++            continue;
++        if (connect(sock, cur->ai_addr, (socklen_t) cur->ai_addrlen) == 0)
++            break;
++#ifdef _WIN32
++        closesocket(sock);
++#else
++        close(sock);
++#endif
++        sock = INVALID_SOCKET;
++    }
++
++    if (sock == INVALID_SOCKET) {
++        fprintf(stderr, "Handshake: could not connect to %s:%s\n", host, port);
++        goto cleanup;
++    }
++
++    if (send(sock, request, (int) strlen(request), 0) < 0) {
++        fprintf(stderr, "Handshake: send failed: %s\n", strerror(errno));
++        goto cleanup;
++    }
++
++    if (recv_json_line(sock, response, sizeof response) != 0) {
++        fprintf(stderr, "Handshake failed: empty response\n");
++        goto cleanup;
++    }
++
++    const char *p = strstr(response, "\"status_code\"");
++    if (!p) {
++        fprintf(stderr, "Handshake failed: missing status_code\n");
++        goto cleanup;
++    }
++    p = strchr(p, ':');
++    if (!p) {
++        fprintf(stderr, "Handshake failed: invalid status_code\n");
++        goto cleanup;
++    }
++    p++;
++    while (*p && isspace((unsigned char)*p))
++        p++;
++    errno = 0;
++    long code = strtol(p, NULL, 10);
++    if (errno != 0) {
++        fprintf(stderr, "Handshake failed: invalid status_code\n");
++        goto cleanup;
++    }
++    if (code != 200) {
++        fprintf(stderr, "Handshake failed: status_code=%ld\n", code);
++        goto cleanup;
++    }
++
++    rc = 0;
++
++cleanup:
++    if (rc == 0 && out_sock) {
++        *out_sock = sock;
++        sock = INVALID_SOCKET;
++    }
++
++    if (sock != INVALID_SOCKET) {
++#ifdef _WIN32
++        closesocket(sock);
++#else
++        close(sock);
++#endif
++    }
++    if (res)
++        freeaddrinfo(res);
++#ifdef _WIN32
++    if (rc != 0 && wsa_started) {
++        WSACleanup();
++        wsa_started = 0;
++    }
++#endif
++    return rc;
++}
++
++static int write_file_line(const char *path, const char *value)
++{
++    FILE *f = fopen(path, "w");
++    if (!f) return -1;
++    fprintf(f, "%s\n", value);
++    fclose(f);
++#ifndef _WIN32
++    chmod(path, 0600);
++#endif
++    return 0;
++}
++
++static int persist_pairing_id(const char *id)
++{
++    char dir_buf[512];
++    char path[600];
++    const char *dir = key_dir_path(dir_buf, sizeof dir_buf);
++    if (snprintf(path, sizeof path, "%s/%s", dir, PAIRING_ID_FILE) < 0)
++        return -1;
++    return write_file_line(path, id);
++}
++
++static int persist_device_id(const char *id)
++{
++    char dir_buf[512];
++    char path[600];
++    const char *dir = key_dir_path(dir_buf, sizeof dir_buf);
++    if (snprintf(path, sizeof path, "%s/%s", dir, DEVICE_ID_FILE) < 0)
++        return -1;
++    return write_file_line(path, id);
++}
++
++static int delete_key_file(const char *filename)
++{
++    char dir_buf[512];
++    char path[600];
++    const char *dir = key_dir_path(dir_buf, sizeof dir_buf);
++
++    if (snprintf(path, sizeof path, "%s/%s", dir, filename) < 0)
++        return -1;
++
++    if (remove(path) == 0 || errno == ENOENT)
++        return 0;
++
++    fprintf(stderr, "Failed to delete stale state file: %s\n", path);
++    return -1;
++}
++
++static int clear_session_state(void)
++{
++    if (delete_key_file(PAIRING_ID_FILE) != 0)
++        return -1;
++    if (delete_key_file(SHARED_SECRET_FILE) != 0)
++        return -1;
++    return 0;
++}
++
+ 
+ int main ( int argc , char *argv[] )
+ {
+     char slot;
+-    char uri[60];
+-    const char *ip = NULL;
+-    int fail = 1, port;
++    char uri[256];
++    int fail = 0;
++    SOCKET handshake_sock = INVALID_SOCKET;
++
++    (void) argc;
++    (void) argv;
+ 
+-    ip = local_ip();
+-    if (!ip)
++    if (do_handshake(&handshake_sock) != 0) {
++        fail = 1;
+         goto err;
++    }
++
++
++    if (ensure_qr_secret(qr_secret, sizeof qr_secret) != 0) {
++        fprintf(stderr, "Failed to load or create qr_secret.\n");
++        fail = 1;
++        goto err;
++    }
++
+ 
+     for (slot = 0; slot < VICC_MAX_SLOTS; slot++) {
+-        port = VPCDPORT+slot;
+-        printf("VPCD hostname:  %s\n", ip);
+-        printf("VPCD port:      %d\n", port);
++        printf("Pairing ID:     %s\n", pairing_id);
++        printf("QR Secret:      %s\n", qr_secret);
+         printf("On your NFC phone with the Remote Smart Card Reader app scan this code:\n");
+-        sprintf(uri, "vpcd://%s:%d", ip, port);
++
++        int n = snprintf(uri, sizeof uri,
++                 "vpcd://pairing_id=%s&qr_secret=%s&ip=%s&port=%s",
++                 pairing_id, qr_secret, DEFAULT_HANDSHAKE_HOST, DEFAULT_HANDSHAKE_PORT);
++        if (n < 0) {
++            fprintf(stderr, "Failed to build QR URI\n");
++            continue;
++        }
++        if (n >= (int) sizeof uri) {
++            fprintf(stderr, "QR URI too long\n");
++            continue;
++        }
+         print_qrcode(uri);
+         if (slot < VICC_MAX_SLOTS-1)
+             puts("");
+     }
+ 
+-    fail = 0;
++    if (handshake_sock != INVALID_SOCKET) {
++        char msg[512];
++        printf("Waiting for pairing message...\n");
++        if (recv_json_line(handshake_sock, msg, sizeof msg) == 0) {
++            if (handle_pairing_message(handshake_sock, msg, qr_secret, NULL, 0) == 0) {
++                printf("SPAKE2+ pairing confirmed; shared secret persisted.\n");
++            }
++        }
++#ifdef _WIN32
++        closesocket(handshake_sock);
++#else
++        close(handshake_sock);
++#endif
++        handshake_sock = INVALID_SOCKET;
++    }
++#ifdef _WIN32
++    if (wsa_started) {
++        WSACleanup();
++        wsa_started = 0;
++    }
++#endif
+ 
+ err:
++    if (handshake_sock != INVALID_SOCKET) {
++#ifdef _WIN32
++        closesocket(handshake_sock);
++#else
++        close(handshake_sock);
++#endif
++    }
++#ifdef _WIN32
++    if (wsa_started) {
++        WSACleanup();
++        wsa_started = 0;
++    }
++#endif
+     return fail;
+ }
+diff --git a/virtualsmartcard/src/vpcd/Makefile.am b/virtualsmartcard/src/vpcd/Makefile.am
+index a560726..bec3e48 100644
+--- a/virtualsmartcard/src/vpcd/Makefile.am
++++ b/virtualsmartcard/src/vpcd/Makefile.am
+@@ -1,5 +1,6 @@
+ libvpcd_la_SOURCES = vpcd.c lock.c
+ libvpcd_la_LDFLAGS = -no-undefined
++libvpcd_la_LIBADD  = -lcrypto
+ 
+ noinst_HEADERS = vpcd.h lock.h
+ 
+diff --git a/virtualsmartcard/src/vpcd/vpcd.c b/virtualsmartcard/src/vpcd/vpcd.c
+index 371daa3..5270218 100644
+--- a/virtualsmartcard/src/vpcd/vpcd.c
++++ b/virtualsmartcard/src/vpcd/vpcd.c
+@@ -23,10 +23,6 @@
+ #include "config.h"
+ #endif
+ 
+-#if (!defined HAVE_DECL_MSG_NOSIGNAL) || !HAVE_DECL_MSG_NOSIGNAL
+-#define MSG_NOSIGNAL 0
+-#endif
+-
+ #ifdef _WIN32
+ #include <winsock2.h>
+ #include <ws2tcpip.h>
+@@ -37,110 +33,717 @@
+ typedef WORD uint16_t;
+ #else
+ #include <arpa/inet.h>
++#include <dirent.h>
+ #include <netdb.h>
+-#include <netinet/in.h>
+-#include <netinet/tcp.h> /* for TCP_NODELAY */
+-#include <poll.h>
+ #include <stdint.h>
+ #include <sys/socket.h>
+-#include <sys/time.h>
+ #include <unistd.h>
+-#define INVALID_SOCKET -1
+ #endif
+ 
+ 
++#include <ctype.h>
+ #include <errno.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <sys/types.h>
+ 
+-static ssize_t sendToVICC(struct vicc_ctx *ctx, size_t size, const unsigned char *buffer);
+-static ssize_t recvFromVICC(struct vicc_ctx *ctx, unsigned char **buffer);
++#include <openssl/evp.h>
++#include <openssl/rand.h>
++#include <openssl/crypto.h>
+ 
+-static ssize_t sendall(SOCKET sock, const void *buffer, size_t size);
+-static ssize_t recvall(SOCKET sock, void *buffer, size_t size);
++#define NONCE_LEN 12
++#define TAG_LEN 16
+ 
+-static SOCKET opensock(unsigned short port);
+-static SOCKET connectsock(const char *hostname, unsigned short port);
++#define DEFAULT_KEY_DIR ".config/vpcd"
++#define SHARED_SECRET_FILE "vpcd_shared_secret.hex"
++#define PAIRING_ID_FILE "vpcd_pairing_id.hex"
++#define DEVICE_ID_FILE  "vpcd_device_id.hex"
++
++static int read_key_file_any(const char *filename, char *out, size_t cap);
++
++static void trim_newline(char *s)
++{
++    size_t n;
++    if (!s)
++        return;
++    n = strlen(s);
++    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
++        s[n - 1] = '\0';
++        n--;
++    }
++}
+ 
+-ssize_t sendall(SOCKET sock, const void *buffer, size_t size)
++static int hex_nibble(int c)
+ {
+-    size_t sent = 0;
+-    ssize_t r;
++    if (c >= '0' && c <= '9')
++        return c - '0';
++    if (c >= 'a' && c <= 'f')
++        return 10 + (c - 'a');
++    if (c >= 'A' && c <= 'F')
++        return 10 + (c - 'A');
++    return -1;
++}
++
++static int hex_to_bytes(const char *hex, unsigned char *out, size_t out_cap, size_t *out_len)
++{
++    size_t len;
++    if (!hex || !out)
++        return -1;
++    len = strlen(hex);
++    if ((len % 2) != 0)
++        return -1;
++    if ((len / 2) > out_cap)
++        return -1;
++    for (size_t i = 0; i < len / 2; i++) {
++        int hi = hex_nibble((unsigned char) hex[i * 2]);
++        int lo = hex_nibble((unsigned char) hex[i * 2 + 1]);
++        if (hi < 0 || lo < 0)
++            return -1;
++        out[i] = (unsigned char) ((hi << 4) | lo);
++    }
++    if (out_len)
++        *out_len = len / 2;
++    return 0;
++}
+ 
+-    /* FIXME we should actually check the length instead of simply casting from
+-     * size_t to ssize_t (or int), which have both the same width! */
+-    while (sent < size) {
+-        r = send(sock, (void *) (((unsigned char *) buffer)+sent),
++static const char *key_dir_path(char *buf, size_t cap)
++{
++    const char *env = getenv("VPCD_KEY_DIR");
++    if (env && *env)
++        return env;
+ #ifdef _WIN32
+-                (int)
++    const char *base = getenv("APPDATA");
++    if (base && *base && buf && cap > 0) {
++        snprintf(buf, cap, "%s\\%s", base, DEFAULT_KEY_DIR);
++        return buf;
++    }
++#else
++    if (geteuid() == 0) {
++        return "/etc/vpcd";
++    }
++    const char *base = getenv("HOME");
++    if (base && *base && buf && cap > 0) {
++        snprintf(buf, cap, "%s/%s", base, DEFAULT_KEY_DIR);
++        return buf;
++    }
+ #endif
+-                (size-sent), MSG_NOSIGNAL);
++    return DEFAULT_KEY_DIR;
++}
++
++static int load_shared_secret(struct vicc_ctx *ctx)
++{
++    char line[256];
++    size_t shared_secret_length = 0;
+ 
+-        if (r < 0)
+-            return r;
++    if (!ctx)
++        return -1;
++
++    OPENSSL_cleanse(ctx->shared_secret, sizeof ctx->shared_secret);
++    ctx->shared_secret_length = 0;
+ 
+-        sent += r;
++    if (read_key_file_any(SHARED_SECRET_FILE, line, sizeof line) != 0) {
++        return -1;
++    }
++
++    trim_newline(line);
++    if (hex_to_bytes(line, ctx->shared_secret, sizeof ctx->shared_secret, &shared_secret_length) != 0) {
++        OPENSSL_cleanse(ctx->shared_secret, sizeof ctx->shared_secret);
++        fprintf(stderr, "Invalid shared secret hex\n");
++        return -1;
++    }
++    if (shared_secret_length != 32) {
++        OPENSSL_cleanse(ctx->shared_secret, sizeof ctx->shared_secret);
++        fprintf(stderr, "Shared secret length invalid (expected 32 bytes)\n");
++        return -1;
+     }
+ 
+-    return (ssize_t) sent;
++    ctx->shared_secret_length = shared_secret_length;
++
++    return 0;
+ }
+ 
+-ssize_t recvall(SOCKET sock, void *buffer, size_t size) {
+-    return recv(sock, buffer,
+-#ifdef _WIN32
+-            (int)
+-#endif
+-            size, MSG_WAITALL|MSG_NOSIGNAL);
++static int load_ids_from_env(struct vicc_ctx *ctx)
++{
++    const char *pairing = getenv("VPCD_PAIRING_ID");
++    const char *device = getenv("VPCD_DEVICE_ID");
++
++    if (!pairing || !*pairing || !device || !*device) {
++        return -1;
++    }
++
++    snprintf(ctx->pairing_id, sizeof ctx->pairing_id, "%s", pairing);
++    snprintf(ctx->device_id, sizeof ctx->device_id, "%s", device);
++    return 0;
+ }
+ 
+-static SOCKET opensock(unsigned short port)
++static int delete_state_file_at(const char *path)
+ {
+-    SOCKET sock;
+-    socklen_t yes = 1;
+-    struct sockaddr_in server_sockaddr;
++    if (!path || !*path)
++        return -1;
+ 
+-    sock = socket(AF_INET, SOCK_STREAM, 0);
+-    if (sock == INVALID_SOCKET)
+-        return INVALID_SOCKET;
++    if (remove(path) == 0 || errno == ENOENT)
++        return 0;
+ 
+-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *) &yes, sizeof yes) != 0) 
+-        goto err;
++    fprintf(stderr, "Failed to delete stale state file: %s\n", path);
++    return -1;
++}
+ 
+-#if HAVE_DECL_SO_NOSIGPIPE
+-    if (setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, (void *) &yes, sizeof yes) != 0)
+-        goto err;
++static int clear_state_file_any(const char *filename)
++{
++    char dir_buf[512];
++    char path[600];
++    const char *dir = key_dir_path(dir_buf, sizeof dir_buf);
++    int failed = 0;
++
++    if (snprintf(path, sizeof path, "%s/%s", dir, filename) < 0)
++        return -1;
++    if (delete_state_file_at(path) != 0)
++        failed = -1;
++
++#ifndef _WIN32
++    if (geteuid() == 0) {
++        if (snprintf(path, sizeof path, "/root/%s/%s", DEFAULT_KEY_DIR, filename) >= 0) {
++            if (delete_state_file_at(path) != 0)
++                failed = -1;
++        }
++
++        DIR *d = opendir("/home");
++        if (d) {
++            struct dirent *ent = NULL;
++            while ((ent = readdir(d)) != NULL) {
++                if (ent->d_name[0] == '.')
++                    continue;
++                if (snprintf(path, sizeof path, "/home/%s/%s/%s",
++                             ent->d_name, DEFAULT_KEY_DIR, filename) < 0)
++                    continue;
++                if (delete_state_file_at(path) != 0)
++                    failed = -1;
++            }
++            closedir(d);
++        }
++    }
+ #endif
+-#ifdef TCP_NODELAY
+-    if(setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (void *) &yes, sizeof yes) != 0)
+-        goto err;
++
++    return failed;
++}
++
++static int clear_session_state(void)
++{
++    int failed = 0;
++
++    if (clear_state_file_any(PAIRING_ID_FILE) != 0)
++        failed = -1;
++    if (clear_state_file_any(SHARED_SECRET_FILE) != 0)
++        failed = -1;
++
++    return failed;
++}
++
++static int response_indicates_stale_pairing(const char *json)
++{
++    if (!json)
++        return 0;
++
++    return strstr(json, "is not complete yet") != NULL ||
++           strstr(json, "No such pairing with ID") != NULL;
++}
++
++static void invalidate_stale_session(struct vicc_ctx *ctx)
++{
++    if (clear_session_state() == 0)
++        fprintf(stderr, "Cleared persisted stale pairing state.\n");
++
++    if (!ctx)
++        return;
++
++    ctx->pairing_id[0] = '\0';
++    ctx->device_id[0] = '\0';
++    OPENSSL_cleanse(ctx->shared_secret, sizeof ctx->shared_secret);
++    ctx->shared_secret_length = 0;
++}
++
++static int recv_line(SOCKET sock, char *out, size_t cap)
++{
++    size_t used = 0;
++    if (!out || cap == 0)
++        return -1;
++
++    while (used < cap - 1) {
++        char c = 0;
++        int n = recv(sock, &c, 1, 0);
++        if (n <= 0)
++            break;
++        if (c == '\n')
++            break;
++        out[used++] = c;
++    }
++
++    out[used] = '\0';
++    if (used == 0)
++        return -1;
++    return 0;
++}
++
++static int send_line(SOCKET sock, const char *s)
++{
++    size_t len = strlen(s);
++    if (send(sock, s, (int) len, 0) < 0)
++        return -1;
++    if (send(sock, "\n", 1, 0) < 0)
++        return -1;
++    return 0;
++}
++
++static int extract_json_string(const char *json, const char *key, char *out, size_t cap)
++{
++    char pattern[64];
++    const char *p = NULL;
++    const char *end = NULL;
++    size_t len;
++
++    if (!json || !key || !out || cap == 0)
++        return -1;
++
++    if (snprintf(pattern, sizeof pattern, "\"%s\"", key) < 0)
++        return -1;
++    p = strstr(json, pattern);
++    if (!p)
++        return -1;
++    p += strlen(pattern);
++    while (*p && *p != ':')
++        p++;
++    if (*p != ':')
++        return -1;
++    p++;
++    while (*p && isspace((unsigned char) *p))
++        p++;
++    if (*p != '"')
++        return -1;
++    p++;
++    end = strchr(p, '"');
++    if (!end)
++        return -1;
++    len = (size_t) (end - p);
++    if (len + 1 > cap)
++        return -1;
++    memcpy(out, p, len);
++    out[len] = '\0';
++    return 0;
++}
++
++static int parse_status_code(const char *json)
++{
++    const char *p = strstr(json, "\"status_code\"");
++    if (!p)
++        return -1;
++    p = strchr(p, ':');
++    if (!p)
++        return -1;
++    p++;
++    while (*p && isspace((unsigned char) *p))
++        p++;
++    errno = 0;
++    long code = strtol(p, NULL, 10);
++    if (errno != 0)
++        return -1;
++    return (int) code;
++}
++
++static int b64_encode(const unsigned char *in, size_t in_len, char *out, size_t out_cap)
++{
++    size_t need = 4 * ((in_len + 2) / 3) + 1;
++    if (out_cap < need)
++        return -1;
++    int n = EVP_EncodeBlock((unsigned char *) out, in, (int) in_len);
++    if (n <= 0)
++        return -1;
++    out[n] = '\0';
++    return 0;
++}
++
++static int b64_decode(const char *in, unsigned char *out, size_t out_cap, size_t *out_len)
++{
++    size_t len = strlen(in);
++    int pad = 0;
++    if (len >= 1 && in[len - 1] == '=') pad++;
++    if (len >= 2 && in[len - 2] == '=') pad++;
++    size_t need = (len / 4) * 3;
++    if (out_cap < need)
++        return -1;
++    int n = EVP_DecodeBlock(out, (const unsigned char *) in, (int) len);
++    if (n < 0)
++        return -1;
++    n -= pad;
++    if (n < 0)
++        return -1;
++    if (out_len)
++        *out_len = (size_t) n;
++    return 0;
++}
++
++static int encrypt_frame(struct vicc_ctx *ctx,
++                         const unsigned char *pt, size_t pt_len,
++                         char *out_b64, size_t out_cap)
++{
++    unsigned char nonce[NONCE_LEN];
++    unsigned char tag[TAG_LEN];
++    unsigned char *pt_chained = NULL;
++    size_t pt_chained_len = 0;
++    unsigned char *ct = NULL;
++    unsigned char *blob = NULL;
++    int len = 0, ct_len = 0;
++    int rc = -1;
++
++    if (!ctx || !pt || !out_b64)
++        return -1;
++
++    if (RAND_bytes(nonce, sizeof nonce) != 1) {
++        fprintf(stderr, "RAND_bytes failed\n");
++        return -1;
++    }
++
++    /* Prepend previous tag so each frame is chained to the prior one. */
++    pt_chained_len = TAG_LEN + pt_len;
++    pt_chained = (unsigned char *) malloc(pt_chained_len);
++    if (!pt_chained)
++        return -1;
++    memcpy(pt_chained, ctx->chain_send, TAG_LEN);
++    memcpy(pt_chained + TAG_LEN, pt, pt_len);
++
++    ct = (unsigned char *) malloc(pt_chained_len);
++    if (!ct)
++        goto cleanup;
++
++    EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
++    if (!c)
++        goto cleanup;
++
++    if (EVP_EncryptInit_ex(c, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1)
++        goto cleanup;
++    if (EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_IVLEN, NONCE_LEN, NULL) != 1)
++        goto cleanup;
++    if (EVP_EncryptInit_ex(c, NULL, NULL, ctx->shared_secret, nonce) != 1)
++        goto cleanup;
++
++    if (EVP_EncryptUpdate(c, ct, &len, pt_chained, (int) pt_chained_len) != 1)
++        goto cleanup;
++    ct_len = len;
++
++    if (EVP_EncryptFinal_ex(c, ct + ct_len, &len) != 1)
++        goto cleanup;
++    ct_len += len;
++
++    if (EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_GET_TAG, TAG_LEN, tag) != 1)
++        goto cleanup;
++
++    size_t total = NONCE_LEN + (size_t) ct_len + TAG_LEN;
++    blob = (unsigned char *) malloc(total);
++    if (!blob)
++        goto cleanup;
++
++    memcpy(blob, nonce, NONCE_LEN);
++    memcpy(blob + NONCE_LEN, ct, ct_len);
++    memcpy(blob + NONCE_LEN + ct_len, tag, TAG_LEN);
++
++    if (b64_encode(blob, total, out_b64, out_cap) != 0)
++        goto cleanup;
++
++    /* Update chaining state only after a frame is successfully serialized. */
++    memcpy(ctx->chain_send, tag, TAG_LEN);
++
++    rc = 0;
++
++cleanup:
++    if (c)
++        EVP_CIPHER_CTX_free(c);
++    if (pt_chained) {
++        OPENSSL_cleanse(pt_chained, pt_chained_len);
++        free(pt_chained);
++    }
++    if (ct) {
++        OPENSSL_cleanse(ct, pt_chained_len);
++        free(ct);
++    }
++    if (blob) {
++        OPENSSL_cleanse(blob, NONCE_LEN + (size_t) ct_len + TAG_LEN);
++        free(blob);
++    }
++    return rc;
++}
++
++static int decrypt_frame(struct vicc_ctx *ctx,
++                         const char *b64,
++                         unsigned char **out, size_t *out_len)
++{
++    unsigned char *blob = NULL;
++    size_t blob_len = 0;
++    unsigned char *pt = NULL;
++    int len = 0, pt_len = 0;
++    int rc = -1;
++
++    if (!ctx || !b64 || !out || !out_len)
++        return -1;
++
++    size_t max_blob = (strlen(b64) / 4 + 1) * 3;
++    blob = (unsigned char *) malloc(max_blob);
++    if (!blob)
++        return -1;
++
++    if (b64_decode(b64, blob, max_blob, &blob_len) != 0)
++        goto cleanup;
++
++    if (blob_len < NONCE_LEN + TAG_LEN)
++        goto cleanup;
++
++    size_t ct_len = blob_len - NONCE_LEN - TAG_LEN;
++    unsigned char *nonce = blob;
++    unsigned char *ct = blob + NONCE_LEN;
++    unsigned char *tag = blob + NONCE_LEN + ct_len;
++
++    pt = (unsigned char *) malloc(ct_len);
++    if (!pt)
++        goto cleanup;
++
++    EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
++    if (!c)
++        goto cleanup;
++
++    if (EVP_DecryptInit_ex(c, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1)
++        goto cleanup;
++    if (EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_IVLEN, NONCE_LEN, NULL) != 1)
++        goto cleanup;
++    if (EVP_DecryptInit_ex(c, NULL, NULL, ctx->shared_secret, nonce) != 1)
++        goto cleanup;
++
++    if (EVP_DecryptUpdate(c, pt, &len, ct, (int) ct_len) != 1)
++        goto cleanup;
++    pt_len = len;
++
++    if (EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_TAG, TAG_LEN, tag) != 1)
++        goto cleanup;
++    if (EVP_DecryptFinal_ex(c, pt + pt_len, &len) != 1) {
++        EVP_CIPHER_CTX_free(c);
++        goto cleanup;
++    }
++    pt_len += len;
++    EVP_CIPHER_CTX_free(c);
++
++    /* Validate chaining prefix and strip it from returned plaintext. */
++    if (pt_len < TAG_LEN + 2)
++        goto cleanup;
++    if (CRYPTO_memcmp(pt, ctx->chain_recv, TAG_LEN) != 0)
++        goto cleanup;
++
++    /* Update expected chaining tag to this frame's tag. */
++    memcpy(ctx->chain_recv, tag, TAG_LEN);
++
++    pt_len -= TAG_LEN;
++    memmove(pt, pt + TAG_LEN, (size_t) pt_len);
++
++    *out = pt;
++    *out_len = (size_t) pt_len;
++    pt = NULL;
++
++    rc = 0;
++
++cleanup:
++    if (pt) {
++        OPENSSL_cleanse(pt, pt_len);
++        free(pt);
++    }
++    if (blob) {
++        OPENSSL_cleanse(blob, blob_len);
++        free(blob);
++    }
++    return rc;
++}
++
++static int mp_handshake(struct vicc_ctx *ctx)
++{
++    char msg[512];
++    char resp[512];
++
++    if (snprintf(msg, sizeof msg,
++            "{\"message_type\":\"handshake\",\"pairing_id\":\"%s\",\"device_id\":\"%s\",\"role\":\"pc\"}",
++            ctx->pairing_id, ctx->device_id) < 0) {
++        return -1;
++    }
++
++    if (send_line(ctx->client_sock, msg) != 0)
++        return -1;
++
++    if (recv_line(ctx->client_sock, resp, sizeof resp) != 0)
++        return -1;
++
++    int code = parse_status_code(resp);
++    if (code != 200) {
++        fprintf(stderr, "Handshake failed: %s\n", resp);
++        return -1;
++    }
++    return 0;
++}
++
++static int mp_send_comm(struct vicc_ctx *ctx, const char *payload_b64)
++{
++    char msg[4096];
++    if (snprintf(msg, sizeof msg,
++            "{\"message_type\":\"communication\",\"source_id\":\"%s\",\"payload\":\"%s\"}",
++            ctx->device_id, payload_b64) < 0) {
++        return -1;
++    }
++    return send_line(ctx->client_sock, msg);
++}
++
++static int mp_wait_status(struct vicc_ctx *ctx)
++{
++    char line[512];
++    for (;;) {
++        if (recv_line(ctx->client_sock, line, sizeof line) != 0)
++            return -1;
++        int code = parse_status_code(line);
++        if (code < 0)
++            continue;
++        if (code != 200) {
++            if (response_indicates_stale_pairing(line))
++                invalidate_stale_session(ctx);
++            fprintf(stderr, "Communication failed: %s\n", line);
++            return -1;
++        }
++        return 0;
++    }
++}
++
++static int mp_recv_payload(struct vicc_ctx *ctx, char *out, size_t cap)
++{
++    char line[4096];
++    for (;;) {
++        if (recv_line(ctx->client_sock, line, sizeof line) != 0)
++            return -1;
++
++        if (strstr(line, "\"status_code\"")) {
++            int code = parse_status_code(line);
++            if (code != 200) {
++                if (response_indicates_stale_pairing(line))
++                    invalidate_stale_session(ctx);
++                return -1;
++            }
++            continue;
++        }
++
++        if (extract_json_string(line, "payload", out, cap) == 0)
++            return 0;
++    }
++}
++
++static int read_file_line(const char *path, char *out, size_t cap)
++{
++    FILE *f = fopen(path, "r");
++    if (!f) return -1;
++    if (!fgets(out, (int) cap, f)) {
++        fclose(f);
++        return -1;
++    }
++    fclose(f);
++    trim_newline(out);
++    return out[0] ? 0 : -1;
++}
++
++static int read_key_file_any(const char *filename, char *out, size_t cap)
++{
++    char dir_buf[512];
++    char path[600];
++    const char *dir = key_dir_path(dir_buf, sizeof dir_buf);
++    if (snprintf(path, sizeof path, "%s/%s", dir, filename) >= 0) {
++        if (read_file_line(path, out, cap) == 0)
++            return 0;
++    }
++
++#ifndef _WIN32
++    if (geteuid() == 0) {
++        if (snprintf(path, sizeof path, "/root/%s/%s", DEFAULT_KEY_DIR, filename) >= 0) {
++            if (read_file_line(path, out, cap) == 0)
++                return 0;
++        }
++
++        DIR *d = opendir("/home");
++        if (d) {
++            struct dirent *ent = NULL;
++            while ((ent = readdir(d)) != NULL) {
++                if (ent->d_name[0] == '.')
++                    continue;
++                if (snprintf(path, sizeof path, "/home/%s/%s/%s",
++                             ent->d_name, DEFAULT_KEY_DIR, filename) < 0)
++                    continue;
++                if (read_file_line(path, out, cap) == 0) {
++                    closedir(d);
++                    return 0;
++                }
++            }
++            closedir(d);
++        }
++    }
+ #endif
+ 
+-    memset(&server_sockaddr, 0, sizeof server_sockaddr);
+-    server_sockaddr.sin_family      = PF_INET;
+-    server_sockaddr.sin_port        = htons(port);
+-    server_sockaddr.sin_addr.s_addr = htonl(INADDR_ANY);
++    return -1;
++}
+ 
+-    if (bind(sock, (struct sockaddr *) &server_sockaddr,
+-                sizeof server_sockaddr) != 0)  {
+-        perror(NULL);
+-        goto err;
++static int load_pairing_id_file(char *out, size_t cap)
++{
++    return read_key_file_any(PAIRING_ID_FILE, out, cap);
++}
++
++static int load_device_id_file(char *out, size_t cap)
++{
++    return read_key_file_any(DEVICE_ID_FILE, out, cap);
++}
++
++static int load_ids(struct vicc_ctx *ctx)
++{
++    if (!ctx)
++        return -1;
++
++    ctx->pairing_id[0] = '\0';
++    ctx->device_id[0] = '\0';
++
++    if (load_ids_from_env(ctx) == 0) {
++        return 0;
+     }
+ 
+-    if (listen(sock, 0) != 0) {
+-        perror(NULL);
+-        goto err;
++    if (load_pairing_id_file(ctx->pairing_id, sizeof ctx->pairing_id) != 0) {
++        return -1;
+     }
+ 
+-    return sock;
++    if (load_device_id_file(ctx->device_id, sizeof ctx->device_id) != 0) {
++        ctx->pairing_id[0] = '\0';
++        ctx->device_id[0] = '\0';
++        return -1;
++    }
+ 
+-err:
+-    close(sock);
++    return 0;
++}
++
++static int vicc_prepare(struct vicc_ctx *ctx)
++{
++    if (!ctx)
++        return 0;
+ 
+-    return INVALID_SOCKET;
++    if (!ctx->pairing_id[0] || !ctx->device_id[0]) {
++        if (load_ids(ctx) != 0)
++            return 0;
++    }
++
++    if (ctx->shared_secret_length != 32) {
++        if (load_shared_secret(ctx) != 0)
++            return 0;
++    }
++
++    return 1;
+ }
+ 
++static ssize_t sendToVICC(struct vicc_ctx *ctx, size_t size, const unsigned char *buffer);
++static ssize_t recvFromVICC(struct vicc_ctx *ctx, unsigned char **buffer);
++static SOCKET connectsock(const char *hostname, unsigned short port);
++
+ static SOCKET connectsock(const char *hostname, unsigned short port)
+ {
+ 	struct addrinfo hints, *res = NULL, *cur;
+@@ -179,135 +782,107 @@ err:
+ 	return sock;
+ }
+ 
+-SOCKET waitforclient(SOCKET server, long secs, long usecs)
+-{
+-    struct sockaddr_in client_sockaddr;
+-    socklen_t client_socklen = sizeof client_sockaddr;
+-
+-#if _WIN32
+-    fd_set rfds;
+-    struct timeval tv;
+-
+-    FD_ZERO(&rfds);
+-#pragma warning(disable:4127)
+-    FD_SET(server, &rfds);
+-#pragma warning(default:4127)
+-
+-    tv.tv_sec = secs;
+-    tv.tv_usec = usecs;
+-
+-    if (select((int) server+1, &rfds, NULL, NULL, &tv) == -1)
+-        return INVALID_SOCKET;
+-
+-    if (FD_ISSET(server, &rfds))
+-    /* work around clumsy define of FD_SET in winsock2.h */
+-
+-#else
+-    int timeout;
+-    struct pollfd pfd;
+-
+-    pfd.fd = server;
+-    pfd.events = POLLIN;
+-    pfd.revents = 0;
+-
+-    timeout = (secs * 1000 + usecs / 1000);
+-
+-    if (poll(&pfd, 1, timeout) == -1)
+-        return INVALID_SOCKET;
+-
+-    if(pfd.revents & POLLIN)
+-#endif
+-        return accept(server, (struct sockaddr *) &client_sockaddr,
+-                &client_socklen);
+-
+-    return INVALID_SOCKET;
+-}
+-
+ static ssize_t sendToVICC(struct vicc_ctx *ctx, size_t length, const unsigned char* buffer)
+ {
+-    ssize_t r;
+     uint16_t size;
+-    char *sendBuffer;
++    unsigned char *plain = NULL;
++    char payload[4096];
+ 
+     if (!ctx || length > 0xFFFF) {
+         errno = EINVAL;
+         return -1;
+     }
+ 
+-    /* allocate buffer for outgoing message */
+-    sendBuffer = (char *) malloc(length + 2);
+-    if (sendBuffer == NULL) {
++    if (!vicc_connect(ctx, 0, 0)) {
++        errno = ENOTCONN;
++        return -1;
++    }
++
++    plain = (unsigned char *) malloc(length + 2);
++    if (!plain) {
+         errno = ENOMEM;
+-	return -1;
++        return -1;
+     }
+ 
+-    /* send size of message on 2 bytes */
+     size = htons((uint16_t) length);
+-    memcpy(sendBuffer, &size, 2);
+-    memcpy(sendBuffer + 2, buffer, length);
+-    r = sendall(ctx->client_sock, sendBuffer, length + 2);
++    memcpy(plain, &size, 2);
++    memcpy(plain + 2, buffer, length);
+ 
+-    if (r < 0)
+-        vicc_eject(ctx);
++    if (encrypt_frame(ctx, plain, length + 2, payload, sizeof payload) != 0) {
++        free(plain);
++        return -1;
++    }
++    free(plain);
+ 
+-    free(sendBuffer);
+-    return r;
++    if (mp_send_comm(ctx, payload) != 0)
++        return -1;
++
++    if (mp_wait_status(ctx) != 0)
++        return -1;
++
++    return (ssize_t) (length + 2);
+ }
+ 
+ static ssize_t recvFromVICC(struct vicc_ctx *ctx, unsigned char **buffer)
+ {
+-    ssize_t r;
+-    uint16_t size;
++    char payload[4096];
++    unsigned char *plain = NULL;
++    size_t plain_len = 0;
++    uint16_t size = 0;
+     unsigned char *p = NULL;
+ 
+-    if (!buffer || !ctx) {
++    if (!ctx || !buffer) {
+         errno = EINVAL;
+         return -1;
+     }
+ 
+-    /* receive size of message on 2 bytes */
+-    r = recvall(ctx->client_sock, &size, sizeof size);
+-    if (r < sizeof size)
+-        return r;
++    if (mp_recv_payload(ctx, payload, sizeof payload) != 0)
++        return -1;
++
++    if (decrypt_frame(ctx, payload, &plain, &plain_len) != 0)
++        return -1;
++
++    if (plain_len < 2) {
++        free(plain);
++        return -1;
++    }
+ 
++    memcpy(&size, plain, 2);
+     size = ntohs(size);
+ 
+-    if (0 != size) {
++    if (size > 0) {
+         p = realloc(*buffer, size);
+         if (p == NULL) {
++            free(plain);
+             errno = ENOMEM;
+             return -1;
+         }
+         *buffer = p;
++        memcpy(*buffer, plain + 2, size);
+     }
+ 
+-    /* receive message */
+-    return recvall(ctx->client_sock, *buffer, size);
++    free(plain);
++    return (ssize_t) size;
+ }
+ 
+ int vicc_eject(struct vicc_ctx *ctx)
+ {
+-    int r = 0;
+     if (ctx && ctx->client_sock != INVALID_SOCKET) {
+-        if (close(ctx->client_sock) < 0) {
+-            r = -1;
+-        }
++        close(ctx->client_sock);
+         ctx->client_sock = INVALID_SOCKET;
+     }
+-    return r;
++    return 0;
+ }
+ 
+ struct vicc_ctx * vicc_init(const char *hostname, unsigned short port)
+ {
+     struct vicc_ctx *r = NULL;
+ 
+-    struct vicc_ctx *ctx = malloc(sizeof *ctx);
++    struct vicc_ctx *ctx = calloc(1, sizeof *ctx);
+     if (!ctx) {
+         goto err;
+     }
+ 
+-    ctx->hostname = NULL;
+-    ctx->io_lock = NULL;
+     ctx->server_sock = INVALID_SOCKET;
+     ctx->client_sock = INVALID_SOCKET;
+     ctx->port = port;
+@@ -322,18 +897,14 @@ struct vicc_ctx * vicc_init(const char *hostname, unsigned short port)
+         goto err;
+     }
+ 
+-    if (hostname) {
+-        ctx->hostname = strdup(hostname);
+-        if (!ctx->hostname) {
+-            goto err;
+-        }
+-        ctx->client_sock = connectsock(hostname, port);
+-    } else {
+-        ctx->server_sock = opensock(port);
+-        if (ctx->server_sock == INVALID_SOCKET) {
+-            goto err;
+-        }
++    if (!hostname)
++        hostname = "localhost";
++
++    ctx->hostname = strdup(hostname);
++    if (!ctx->hostname) {
++        goto err;
+     }
++
+     r = ctx;
+ 
+ err:
+@@ -346,22 +917,19 @@ err:
+ 
+ int vicc_exit(struct vicc_ctx *ctx)
+ {
+-    int r = vicc_eject(ctx);
++    int r = 0;
+     if (ctx) {
+         free_lock(ctx->io_lock);
+         free(ctx->hostname);
+-        if (ctx->server_sock != INVALID_SOCKET) {
+-            ctx->server_sock = close(ctx->server_sock);
+-            if (ctx->server_sock == INVALID_SOCKET) {
+-                r = -1;
+-            }
++        if (ctx->client_sock != INVALID_SOCKET) {
++            ctx->client_sock = close(ctx->client_sock);
+         }
++        OPENSSL_cleanse(ctx->shared_secret, sizeof ctx->shared_secret);
+         free(ctx);
+ #ifdef _WIN32
+         WSACleanup();
+ #endif
+     }
+-
+     return r;
+ }
+ 
+@@ -392,24 +960,31 @@ ssize_t vicc_transmit(struct vicc_ctx *ctx,
+ 
+ int vicc_connect(struct vicc_ctx *ctx, long secs, long usecs)
+ {
++    (void) secs;
++    (void) usecs;
++
+     if (!ctx)
+         return 0;
+ 
++    if (!vicc_prepare(ctx))
++        return 0;
++
+     if (ctx->client_sock == INVALID_SOCKET) {
+-        if(!ctx->hostname) {
+-            /* server mode, try to accept a client */
+-            ctx->client_sock = waitforclient(ctx->server_sock, secs, usecs);
+-        } else {
+-            /* client mode, try to connect (again) */
+-            ctx->client_sock = connectsock(ctx->hostname, ctx->port);
++        ctx->client_sock = connectsock(ctx->hostname, ctx->port);
++        if (ctx->client_sock == INVALID_SOCKET)
++            return 0;
++        if (mp_handshake(ctx) != 0) {
++            close(ctx->client_sock);
++            ctx->client_sock = INVALID_SOCKET;
++            return 0;
+         }
++
++        /* Reset chaining state on each new TCP connection. */
++        memset(ctx->chain_send, 0, TAG_LEN);
++        memset(ctx->chain_recv, 0, TAG_LEN);
+     }
+ 
+-    if (ctx->client_sock == INVALID_SOCKET)
+-        /* not connected */
+-        return 0;
+-    else
+-        return 1;
++    return 1;
+ }
+ 
+ int vicc_present(struct vicc_ctx *ctx) {
+diff --git a/virtualsmartcard/src/vpcd/vpcd.h b/virtualsmartcard/src/vpcd/vpcd.h
+index b5c3635..2dd990e 100644
+--- a/virtualsmartcard/src/vpcd/vpcd.h
++++ b/virtualsmartcard/src/vpcd/vpcd.h
+@@ -26,6 +26,9 @@
+ #ifdef _WIN32
+ #include <stddef.h>
+ #include <winsock2.h>
++#ifndef INVALID_SOCKET
++#define INVALID_SOCKET ((SOCKET) ~0)
++#endif
+ #ifndef HAVE_CONFIG_H
+ /* we assume that ./configure has not defined ssize_t for us */
+ typedef int ssize_t;
+@@ -33,6 +36,9 @@ typedef int ssize_t;
+ #else
+ #define SOCKET int
+ #include <unistd.h>
++#ifndef INVALID_SOCKET
++#define INVALID_SOCKET -1
++#endif
+ #endif
+ 
+ #define VPCD_CTRL_LEN 	1
+@@ -48,6 +54,15 @@ struct vicc_ctx {
+         char *hostname;
+         unsigned short port;
+         void *io_lock;
++
++        char pairing_id[64];
++        char device_id[64];
++        unsigned char shared_secret[32];
++        size_t shared_secret_length;
++
++        /* Anti-replay chaining state (per direction). */
++        unsigned char chain_send[16];
++        unsigned char chain_recv[16];
+ };
+ 
+ #ifdef __cplusplus
